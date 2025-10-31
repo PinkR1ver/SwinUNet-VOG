@@ -1,0 +1,49 @@
+{
+    "data": {
+        "data_dir": "MPIIGaze/Data/Normalized",
+        "train_ratio": 0.7,
+        "val_ratio": 0.1,
+        "test_ratio": 0.2,
+        "batch_size": 64,
+        "num_workers": 4,
+        "train_augment": true
+    },
+    "model": {
+        "img_size": [36, 60],
+        "in_chans": 3,
+        "embed_dim": 96,
+        "depths": [2, 2, 2],
+        "num_heads": [3, 6, 12],
+        "window_size": 7,
+        "drop_rate": 0.1
+    },
+    "training": {
+        "epochs": 50,
+        "lr": 0.001,
+        "lr_scheduler": "ReduceLROnPlateau",
+        "lr_scheduler_params": {
+            "mode": "min",
+            "factor": 0.5,
+            "patience": 5
+        },
+        "optimizer": "AdamW",
+        "optimizer_params": {
+            "lr": 0.001,
+            "weight_decay": 0.01
+        },
+        "loss": "MSE",
+        "save_dir": "checkpoints",
+        "resume": null,
+        "log_interval": 500
+    },
+    "evaluation": {
+        "save_dir": "results",
+        "save_plots": true,
+        "metrics": ["mean_error", "median_error", "std_error", "percentile_95", "percentile_99"]
+    },
+    "hardware": {
+        "device": "auto",
+        "num_workers": 4
+    }
+}
+
