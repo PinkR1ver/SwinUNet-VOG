@@ -15,18 +15,20 @@ import torch
 class MPIIGazeDataset(Dataset):
     """MPIIGaze Dataset for Gaze Estimation."""
     
-    def __init__(self, data_dir, participants, transform=None, augment=False):
+    def __init__(self, data_dir, participants, transform=None, augment=False, preprocessor=None):
         """
         Args:
             data_dir: Path to MPIIGaze/Data/Normalized/
             participants: List of participant IDs (e.g., ['p00', 'p01'])
-            transform: Optional transform to apply to images
+            transform: Optional transform to apply to images (deprecated, use preprocessor)
             augment: Whether to apply data augmentation
+            preprocessor: Optional image preprocessor for handling different camera standards
         """
         self.data_dir = Path(data_dir)
         self.participants = participants
         self.transform = transform
         self.augment = augment
+        self.preprocessor = preprocessor
         
         # Load all data
         self.images = []
@@ -108,13 +110,19 @@ class MPIIGazeDataset(Dataset):
         image = self.images[idx].copy()
         gaze = self.gaze_vectors[idx].copy()
         
-        # Convert to torch tensors
-        image = torch.from_numpy(image).float()
-        gaze = torch.from_numpy(gaze).float()
-        
-        # Normalize image to [0, 1]
-        if image.max() > 1:
-            image = image / 255.0
+        # Apply preprocessor if provided (for handling different camera standards)
+        if self.preprocessor is not None:
+            # Preprocessor expects numpy array and returns torch tensor
+            image = self.preprocessor(image)
+            gaze = torch.from_numpy(gaze).float()
+        else:
+            # Convert to torch tensors
+            image = torch.from_numpy(image).float()
+            gaze = torch.from_numpy(gaze).float()
+            
+            # Normalize image to [0, 1]
+            if image.max() > 1:
+                image = image / 255.0
         
         # Apply data augmentation if enabled
         if self.augment and np.random.rand() > 0.5:
@@ -161,7 +169,7 @@ def split_participants(all_participants, train_ratio=0.7, val_ratio=0.1, test_ra
     return train_participants, val_participants, test_participants
 
 
-def get_data_loaders(data_dir, batch_size=32, num_workers=4, train_augment=True):
+def get_data_loaders(data_dir, batch_size=32, num_workers=4, train_augment=True, preprocessor=None):
     """
     Get data loaders for train, validation, and test sets.
     
@@ -170,6 +178,7 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4, train_augment=True)
         batch_size: Batch size for training
         num_workers: Number of worker threads for data loading
         train_augment: Whether to use data augmentation for training
+        preprocessor: Optional image preprocessor for handling different camera standards
     
     Returns:
         train_loader, val_loader, test_loader
@@ -189,13 +198,13 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4, train_augment=True)
     
     # Create datasets
     train_dataset = MPIIGazeDataset(
-        data_dir, train_participants, augment=train_augment
+        data_dir, train_participants, augment=train_augment, preprocessor=preprocessor
     )
     val_dataset = MPIIGazeDataset(
-        data_dir, val_participants, augment=False
+        data_dir, val_participants, augment=False, preprocessor=preprocessor
     )
     test_dataset = MPIIGazeDataset(
-        data_dir, test_participants, augment=False
+        data_dir, test_participants, augment=False, preprocessor=preprocessor
     )
     
     # Create data loaders
@@ -215,7 +224,7 @@ def get_data_loaders(data_dir, batch_size=32, num_workers=4, train_augment=True)
     return train_loader, val_loader, test_loader
 
 
-def get_person_specific_loaders(data_dir, participant_id, batch_size=32, num_workers=4):
+def get_person_specific_loaders(data_dir, participant_id, batch_size=32, num_workers=4, preprocessor=None):
     """
     Get data loaders for person-specific evaluation.
     Uses one participant for test, rest for train/val.
@@ -225,6 +234,7 @@ def get_person_specific_loaders(data_dir, participant_id, batch_size=32, num_wor
         participant_id: Participant ID to use as test set (e.g., 'p00')
         batch_size: Batch size
         num_workers: Number of worker threads
+        preprocessor: Optional image preprocessor for handling different camera standards
     
     Returns:
         train_loader, val_loader, test_loader
@@ -245,9 +255,9 @@ def get_person_specific_loaders(data_dir, participant_id, batch_size=32, num_wor
     print(f"  Test participant: {test_participants}")
     
     # Create datasets
-    train_dataset = MPIIGazeDataset(data_dir, train_participants, augment=True)
-    val_dataset = MPIIGazeDataset(data_dir, val_participants, augment=False)
-    test_dataset = MPIIGazeDataset(data_dir, test_participants, augment=False)
+    train_dataset = MPIIGazeDataset(data_dir, train_participants, augment=True, preprocessor=preprocessor)
+    val_dataset = MPIIGazeDataset(data_dir, val_participants, augment=False, preprocessor=preprocessor)
+    test_dataset = MPIIGazeDataset(data_dir, test_participants, augment=False, preprocessor=preprocessor)
     
     # Create data loaders
     train_loader = DataLoader(

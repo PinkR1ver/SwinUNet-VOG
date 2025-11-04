@@ -14,6 +14,53 @@ from model import SwinUNet
 from data import get_data_loaders, get_person_specific_loaders
 
 
+def visualize_sample_predictions(all_predictions, all_targets, all_errors, 
+                                all_images, save_dir, num_samples=16):
+    """可视化样本预测结果"""
+    # 使用前num_samples个样本
+    num_samples = min(num_samples, len(all_errors))
+    sample_images = all_images[:num_samples]
+    sample_errors = all_errors[:num_samples]
+    sample_predictions = all_predictions[:num_samples]
+    sample_targets = all_targets[:num_samples]
+    
+    # 创建可视化
+    grid_size = int(np.ceil(np.sqrt(num_samples)))
+    fig, axes = plt.subplots(grid_size, grid_size, figsize=(15, 15))
+    axes = axes.flatten()
+    
+    for i in range(num_samples):
+        ax = axes[i]
+        
+        # 显示图像
+        img = sample_images[i].permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 1)
+        ax.imshow(img, cmap='gray' if img.shape[2] == 1 else None)
+        
+        # 归一化gaze向量
+        pred_gaze = sample_predictions[i]
+        target_gaze = sample_targets[i]
+        pred_gaze = pred_gaze / (np.linalg.norm(pred_gaze) + 1e-8)
+        target_gaze = target_gaze / (np.linalg.norm(target_gaze) + 1e-8)
+        
+        # 显示信息
+        error = sample_errors[i]
+        title = f'Error: {error:.2f}°'
+        title += f'\nPred: [{pred_gaze[0]:.2f}, {pred_gaze[1]:.2f}, {pred_gaze[2]:.2f}]'
+        title += f'\nGT: [{target_gaze[0]:.2f}, {target_gaze[1]:.2f}, {target_gaze[2]:.2f}]'
+        
+        ax.set_title(title, fontsize=8)
+        ax.axis('off')
+    
+    # 隐藏多余的子图
+    for i in range(num_samples, len(axes)):
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'prediction_samples.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def angle_error(pred, target):
     """
     Calculate angular error between predicted and target gaze vectors.
@@ -45,6 +92,7 @@ def evaluate(model, test_loader, criterion, device, save_plots=True, save_dir='r
     all_errors = []
     all_predictions = []
     all_targets = []
+    all_images = []  # 保存图像用于可视化
     running_loss = 0.0
     
     print('Evaluating on test set...')
@@ -60,6 +108,7 @@ def evaluate(model, test_loader, criterion, device, save_plots=True, save_dir='r
             all_errors.extend(errors.cpu().numpy())
             all_predictions.append(output.cpu().numpy())
             all_targets.append(gaze.cpu().numpy())
+            all_images.append(images.cpu())  # 保存图像
             running_loss += loss.item()
             
             if batch_idx % 200 == 0:
@@ -137,6 +186,11 @@ def evaluate(model, test_loader, criterion, device, save_plots=True, save_dir='r
         plt.close()
         
         print(f'\nPlots saved to {save_dir}/')
+        
+        # Generate sample visualizations
+        all_images_tensor = torch.cat(all_images, dim=0)
+        visualize_sample_predictions(all_predictions, all_targets, all_errors, 
+                                   all_images_tensor, save_dir)
     
     return {
         'mean_error': mean_error,

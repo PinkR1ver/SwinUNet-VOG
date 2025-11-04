@@ -44,6 +44,16 @@
     "hardware": {
         "device": "auto",
         "num_workers": 4
+    },
+    "preprocessing": {
+        "mode": "simple",
+        "normalize_illumination": false,
+        "normalize_contrast": false,
+        "normalize_color": false,
+        "gamma_correction": false,
+        "adaptive_hist_eq": false,
+        "use_geometric_normalization": false,
+        "comment": "mode: 'simple' for MPIIGaze normalized data, 'full' for different camera standards. use_geometric_normalization: true to handle distance and position variations"
     }
 }
 

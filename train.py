@@ -12,9 +12,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
+import matplotlib.pyplot as plt
+import numpy as np
 
 from model import SwinUNet
 from data import get_data_loaders, get_person_specific_loaders
+from preprocessing import get_preprocessor
 
 
 def angle_error(pred, target):
@@ -164,16 +167,24 @@ def main():
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
     
+    # Create preprocessor (if needed for different camera standards)
+    preprocessor = None
+    if config.get('preprocessing', {}).get('mode', 'simple') == 'full':
+        preprocessor = get_preprocessor(config)
+        print('Using full preprocessor for different camera standards')
+    
     # Load data
     print('Loading data...')
     if args.person_specific:
         train_loader, val_loader, test_loader = get_person_specific_loaders(
-            data_dir, args.person_id, batch_size=batch_size, num_workers=num_workers
+            data_dir, args.person_id, batch_size=batch_size, num_workers=num_workers,
+            preprocessor=preprocessor
         )
     else:
         train_loader, val_loader, test_loader = get_data_loaders(
             data_dir, batch_size=batch_size, num_workers=num_workers, 
-            train_augment=config['data']['train_augment']
+            train_augment=config['data']['train_augment'],
+            preprocessor=preprocessor
         )
     
     # Create model
@@ -302,6 +313,81 @@ def main():
             print(f'Best model saved to {save_dir}/checkpoint_best.pth')
     
     print(f'\nTraining completed! Best validation angle: {best_val_angle:.2f}°')
+    
+    # Save training curves
+    print('Saving training curves...')
+    save_training_curves(train_losses, val_losses, train_angles, val_angles, save_dir)
+    
+    # Save training summary
+    training_summary = {
+        'total_epochs': epochs,
+        'best_val_angle': best_val_angle,
+        'final_train_loss': train_losses[-1] if train_losses else None,
+        'final_val_loss': val_losses[-1] if val_losses else None,
+        'final_train_angle': train_angles[-1] if train_angles else None,
+        'final_val_angle': val_angles[-1] if val_angles else None,
+    }
+    with open(os.path.join(save_dir, 'training_summary.json'), 'w') as f:
+        json.dump(training_summary, f, indent=2)
+    
+    print(f'Training curves and summary saved to {save_dir}/')
+
+
+def save_training_curves(train_losses, val_losses, train_angles, val_angles, save_dir):
+    """Save training curves as plots."""
+    os.makedirs(save_dir, exist_ok=True)
+    epochs = range(1, len(train_losses) + 1)
+    
+    # Loss curves
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
+    plt.plot(epochs, val_losses, 'r-', label='Val Loss', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Angle error curves
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, train_angles, 'b-', label='Train Angle Error', linewidth=2)
+    plt.plot(epochs, val_angles, 'r-', label='Val Angle Error', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Angular Error (degrees)')
+    plt.title('Training and Validation Angular Error')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Separate detailed plots
+    # Loss plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2, marker='o', markersize=3)
+    plt.plot(epochs, val_losses, 'r-', label='Val Loss', linewidth=2, marker='s', markersize=3)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Loss Curves', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(save_dir, 'loss_curves.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Angle error plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_angles, 'b-', label='Train Angle Error', linewidth=2, marker='o', markersize=3)
+    plt.plot(epochs, val_angles, 'r-', label='Val Angle Error', linewidth=2, marker='s', markersize=3)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Angular Error (degrees)', fontsize=12)
+    plt.title('Angular Error Curves', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(save_dir, 'angle_error_curves.png'), dpi=300, bbox_inches='tight')
+    plt.close()
 
 
 if __name__ == '__main__':
