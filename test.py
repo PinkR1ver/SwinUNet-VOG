@@ -193,12 +193,12 @@ def evaluate(model, test_loader, criterion, device, save_plots=True, save_dir='r
                                    all_images_tensor, save_dir)
     
     return {
-        'mean_error': mean_error,
-        'median_error': median_error,
-        'std_error': std_error,
-        'percentile_95': percentile_95,
-        'percentile_99': percentile_99,
-        'avg_loss': avg_loss
+        'mean_error': float(mean_error),
+        'median_error': float(median_error),
+        'std_error': float(std_error),
+        'percentile_95': float(percentile_95),
+        'percentile_99': float(percentile_99),
+        'avg_loss': float(avg_loss)
     }
 
 
