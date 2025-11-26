@@ -272,6 +272,10 @@ class GazeVisualizerApp(ctk.CTk):
         self.is_processing = False
         self.video_path = None
         
+        # Cache for video frames and eye images
+        self.frame_cache = []  # List of (frame_bgr, eye_img_rgb)
+        self.draggable_marker = None
+        
         self.setup_ui()
         
         # Try to load default checkpoint
@@ -398,11 +402,13 @@ class GazeVisualizerApp(ctk.CTk):
         self.gaze_history = []
         self.start_time = time.time()
         self.time_history = []
+        self.eye_history = [] # Cache processed eye images for review
+        self.frame_index_history = [] # Map time to frame index
         
         self.fig = plt.figure(figsize=(5, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_title("Gaze Angles over Time")
-        self.ax.set_ylim(-45, 45) # Fixed range based on MPIIGaze distribution
+        self.ax.set_ylim(-25, 45) # Optimized range based on MPIIGaze statistics
         self.ax.set_xlabel("Video Time (s)")
         self.ax.set_ylabel("Angle (degrees)")
         
@@ -457,6 +463,9 @@ class GazeVisualizerApp(ctk.CTk):
             
             self.normalizer = MediaPipeEyeNormalizer(eye='left')
             
+            # Clear cache for new video
+            self.frame_cache = []
+            
             frame_count = 0
             while self.is_processing:
                 ret, frame = cap.read()
@@ -470,6 +479,9 @@ class GazeVisualizerApp(ctk.CTk):
                 # Extract Eye
                 roi_tensor, roi_display, is_blinking = self.normalizer.extract(frame)
                 
+                # Cache frame and eye image for later scrubbing
+                self.frame_cache.append((frame.copy(), roi_display.copy() if roi_display is not None else None))
+                
                 # Blink handling
                 if is_blinking:
                     # If blinking, we skip inference to avoid artifacts
@@ -477,6 +489,15 @@ class GazeVisualizerApp(ctk.CTk):
                     # For visualization, we can just skip this frame update or show last valid
                     self.gaze_history.append(np.array([np.nan, np.nan, np.nan]))
                     self.time_history.append(timestamp)
+                    
+                    # Store None or placeholder for blink eye image (or the closed eye itself)
+                    # Better to store the closed eye for review!
+                    if roi_display is not None:
+                        self.eye_history.append(roi_display)
+                    else:
+                        # Fallback if detection failed completely
+                        self.eye_history.append(np.zeros((36, 60, 3), dtype=np.uint8))
+                    self.frame_index_history.append(frame_count - 1)
                     
                     # Optional: Update visualization with "Blinking" status but no new point
                     # For speed, we might just skip visual update during blink
@@ -495,6 +516,8 @@ class GazeVisualizerApp(ctk.CTk):
                     # Record history
                     self.gaze_history.append(gaze_pred)
                     self.time_history.append(timestamp)
+                    self.eye_history.append(roi_display)
+                    self.frame_index_history.append(frame_count - 1) # 0-based index
                     
                     # Update GUI with correct timestamp
                     # Update visualization less frequently to speed up processing (e.g., every 3rd frame)
@@ -589,11 +612,30 @@ class GazeVisualizerApp(ctk.CTk):
         self.btn_start.configure(state="normal")
         self.btn_select.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-        self.label_status.configure(text="Processing and Filtering finished.")
+        self.label_status.configure(text="Review Mode: Drag on plot to see video frame.")
         
-        # Close eye window
-        if hasattr(self, 'win_eye') and self.win_eye.winfo_exists():
-            self.win_eye.destroy()
+        # Keep eye window open for review
+        if not hasattr(self, 'win_eye') or not self.win_eye.winfo_exists():
+            self.win_eye = ctk.CTkToplevel(self)
+            self.win_eye.title("Review: Extracted Eye")
+            self.win_eye.geometry("300x200")
+            self.lbl_eye_img = ctk.CTkLabel(self.win_eye, text="")
+            self.lbl_eye_img.pack(expand=True, fill="both")
+        else:
+            self.win_eye.title("Review: Extracted Eye")
+            
+        # Create Video Review Window
+        if not hasattr(self, 'win_video') or not self.win_video.winfo_exists():
+            self.win_video = ctk.CTkToplevel(self)
+            self.win_video.title("Review: Original Video")
+            self.win_video.geometry("640x480")
+            self.lbl_video_img = ctk.CTkLabel(self.win_video, text="Click on plot to load frame")
+            self.lbl_video_img.pack(expand=True, fill="both")
+            
+        # Re-open video for random access
+        if hasattr(self, 'review_cap') and self.review_cap.isOpened():
+            self.review_cap.release()
+        self.review_cap = cv2.VideoCapture(self.video_path)
             
         # Update plot with smoothed data comparison
         if hasattr(self, 'fig'):
@@ -640,11 +682,77 @@ class GazeVisualizerApp(ctk.CTk):
             self.ax.set_xlim(0, max(10, times[-1]))
             
             # Keep fixed Y-axis for consistent comparison
-            self.ax.set_ylim(-45, 45)
+            self.ax.set_ylim(-25, 45)
+            
+            # Add vertical cursor line
+            self.cursor_line = self.ax.axvline(x=0, color='k', linestyle=':', linewidth=1, alpha=0.8)
             
             self.canvas.draw()
             
-            # Removed old image conversion code since we use Canvas
+            # Connect events
+            self.canvas.mpl_connect('button_press_event', self.on_plot_interaction)
+            self.canvas.mpl_connect('motion_notify_event', self.on_plot_interaction)
+
+    def on_plot_interaction(self, event):
+        """Handle mouse clicks and drags on the plot."""
+        if event.inaxes != self.ax:
+            return
+            
+        # Only respond to left click drag or click
+        if event.button != 1 and event.name == 'button_press_event':
+            # Allow other buttons for zoom/pan
+            return
+        if event.name == 'motion_notify_event' and event.button != 1:
+            return
+            
+        # Get time from x-axis
+        target_time = event.xdata
+        if target_time is None:
+            return
+            
+        # Update cursor
+        self.cursor_line.set_xdata([target_time])
+        self.canvas.draw_idle() # Efficient redraw
+        
+        # Find closest frame
+        times = np.array(self.time_history)
+        idx = (np.abs(times - target_time)).argmin()
+        
+        # Update Eye View (Fast)
+        if idx < len(self.eye_history):
+            eye_img = self.eye_history[idx]
+            if eye_img is not None:
+                h, w = eye_img.shape[:2]
+                scale = 4
+                eye_img_big = cv2.resize(eye_img, (w*scale, h*scale), interpolation=cv2.INTER_NEAREST)
+                img = Image.fromarray(eye_img_big)
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w*scale, h*scale))
+                if hasattr(self, 'win_eye') and self.win_eye.winfo_exists():
+                    self.lbl_eye_img.configure(image=ctk_img)
+                    self.lbl_eye_img.image = ctk_img
+        
+        # Update Video View (Slower, maybe skip if dragging too fast?)
+        # For now, just do it.
+        if hasattr(self, 'review_cap') and self.review_cap.isOpened() and idx < len(self.frame_index_history):
+            frame_idx = self.frame_index_history[idx]
+            self.review_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = self.review_cap.read()
+            if ret and hasattr(self, 'win_video') and self.win_video.winfo_exists():
+                # Resize to fit window
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w = frame_rgb.shape[:2]
+                # Scale down if too big
+                max_h = 400
+                if h > max_h:
+                    scale = max_h / h
+                    w = int(w * scale)
+                    h = int(h * scale)
+                    frame_rgb = cv2.resize(frame_rgb, (w, h))
+                
+                img = Image.fromarray(frame_rgb)
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+                self.lbl_video_img.configure(image=ctk_img, text="")
+                self.lbl_video_img.image = ctk_img
             
     def reset_ui(self):
         self.is_processing = False
