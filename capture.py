@@ -19,8 +19,19 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 import time
 
+# 设置环境变量减少MediaPipe/TensorFlow的警告
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 只显示错误信息
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # 禁用oneDNN优化警告
+
 import cv2
 import numpy as np
+
+# 导入 SDK 封装
+try:
+    from sdk_wrapper import UnifiedCameraCapture, CameraCapabilities as SDKCapabilities
+except ImportError:
+    print("警告：无法导入 SDK 封装，将使用纯 OpenCV 模式")
+    UnifiedCameraCapture = None
 
 try:
     import mediapipe as mp
@@ -61,6 +72,10 @@ class EyeDetector:
             return
         
         self.enabled = True
+        # 禁用MediaPipe的feedback manager警告
+        import os
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 减少TensorFlow日志
+
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
@@ -126,17 +141,39 @@ class CameraCapabilities:
     fps_values: List[float] = field(default_factory=list)
 
 
-def detect_camera_capabilities(device_index: int, backend: int) -> CameraCapabilities:
+def detect_camera_capabilities(device_index: int, backend: int, existing_capture=None) -> tuple[CameraCapabilities, str]:
     """自动检测相机支持的分辨率和帧率预设。
-    
-    使用多种方法尝试检测，包括系统级查询（macOS）。
+
+    优先使用 SDK 检测，如果不可用则使用 OpenCV。
+
+    Args:
+        device_index: 设备索引
+        backend: OpenCV 后端
+        existing_capture: 可选的现有 UnifiedCameraCapture 实例，避免重复创建
     """
     capabilities = CameraCapabilities()
+
+    # 使用提供的实例，或者创建一个新的
+    capture = existing_capture
+
+    # 尝试使用 SDK 检测
+    if capture and capture.is_using_sdk():
+        try:
+            sdk_caps = capture.get_capabilities(device_index)
+            capabilities.resolutions = sdk_caps.resolutions
+            capabilities.fps_values = sdk_caps.fps_values
+
+            if capabilities.resolutions and capabilities.fps_values:
+                return capabilities, "SDK"
+        except Exception as e:
+            print(f"SDK 检测失败: {e}，回退到 OpenCV")
+
+    # OpenCV 备选检测
     cap = cv2.VideoCapture(device_index, backend)
-    
+
     if not cap.isOpened():
-        return capabilities
-    
+        return capabilities, "OpenCV"
+
     # 常见的分辨率预设
     common_resolutions = [
         (320, 240),    # QVGA
@@ -149,20 +186,20 @@ def detect_camera_capabilities(device_index: int, backend: int) -> CameraCapabil
         (2560, 1440),  # QHD
         (3840, 2160),  # 4K
     ]
-    
+
     # 常见的帧率
     common_fps = [15, 24, 25, 30, 48, 50, 60, 120]
-    
+
     # 方法1：尝试直接设置并检测（对大多数相机有效）
     tested_resolutions = set()
     for width, height in common_resolutions:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         time.sleep(0.05)  # 给相机时间响应
-        
+
         actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
+
         # 记录实际获得的分辨率（即使不完全匹配请求）
         if actual_width > 0 and actual_height > 0:
             res = (actual_width, actual_height)
@@ -170,20 +207,20 @@ def detect_camera_capabilities(device_index: int, backend: int) -> CameraCapabil
                 tested_resolutions.add(res)
                 if res not in capabilities.resolutions:
                     capabilities.resolutions.append(res)
-    
+
     # 方法2：尝试帧率（在一个稳定的分辨率下）
     if capabilities.resolutions:
         # 使用最常见的分辨率 640x480 测试帧率
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         time.sleep(0.1)
-    
+
     tested_fps = set()
     for fps in common_fps:
         cap.set(cv2.CAP_PROP_FPS, fps)
         time.sleep(0.05)
         actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        
+
         # 允许 ±2 FPS 的容差
         if actual_fps > 0:
             fps_rounded = round(actual_fps)
@@ -191,20 +228,20 @@ def detect_camera_capabilities(device_index: int, backend: int) -> CameraCapabil
                 tested_fps.add(fps_rounded)
                 if fps_rounded not in capabilities.fps_values:
                     capabilities.fps_values.append(float(fps_rounded))
-    
+
     cap.release()
-    
+
     # 排序
     capabilities.resolutions.sort()
     capabilities.fps_values.sort()
-    
+
     # 如果检测失败，返回默认值
     if not capabilities.resolutions:
         capabilities.resolutions = [(640, 480), (1280, 720), (1920, 1080)]
     if not capabilities.fps_values:
         capabilities.fps_values = [24.0, 30.0, 60.0]
-    
-    return capabilities
+
+    return capabilities, "OpenCV"
 
 
 @dataclass
@@ -220,23 +257,36 @@ class CaptureSettings:
 
 class CaptureApp:
     """现代化的摄像头录制应用 UI。"""
-    
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("SwinUNet-VOG - 眼睛数据采集工具")
         self.root.geometry("1000x750")
         self.root.resizable(True, True)
-        
+
         self.backend = get_camera_backend()
         self.settings: Optional[CaptureSettings] = None
         self.preview_running = False
         self.preview_frame = None
         self.camera_thread = None
         self.frame_queue: queue.Queue = queue.Queue(maxsize=2)
-        
+
+        # 初始化摄像头捕获器
+        self.camera_capture = UnifiedCameraCapture() if UnifiedCameraCapture else None
+        if self.camera_capture:
+            self.camera_capture.initialize()
+
         self._build_ui()
         self.refresh_cameras()
-    
+
+    def __del__(self):
+        """清理资源"""
+        if hasattr(self, 'camera_capture') and self.camera_capture:
+            try:
+                self.camera_capture.uninitialize()
+            except:
+                pass
+
     def _build_ui(self) -> None:
         """构建现代化UI。"""
         # 使用 grid 布局管理器，更灵活
@@ -441,6 +491,18 @@ MJPG (Motion JPEG，推荐高帧率)
     def _list_cameras(self) -> Dict[int, str]:
         """列出所有可用相机。"""
         available = {}
+
+        # 优先使用 SDK 枚举设备
+        if self.camera_capture:
+            try:
+                devices = self.camera_capture.enum_devices()
+                for i, device in enumerate(devices):
+                    available[i] = device.name
+                return available
+            except Exception as e:
+                print(f"SDK 枚举设备失败: {e}，回退到 OpenCV")
+
+        # OpenCV 备选方案
         for index in range(10):
             cap = cv2.VideoCapture(index, self.backend)
             if cap.isOpened():
@@ -458,10 +520,9 @@ MJPG (Motion JPEG，推荐高帧率)
         
         device_index = int(device_str.split(":")[0])
         print(f"正在检测摄像头 {device_index} 的能力...")
-        capabilities = detect_camera_capabilities(device_index, self.backend)
-        
-        print(f"检测到的分辨率: {capabilities.resolutions}")
-        print(f"检测到的帧率: {capabilities.fps_values}")
+        capabilities, detection_method = detect_camera_capabilities(device_index, self.backend, self.camera_capture)
+
+        print(f"使用 {detection_method} 检测到能力：分辨率 {capabilities.resolutions}，帧率 {capabilities.fps_values}")
         
         # 更新分辨率
         resolution_items = [f"{w}×{h}" for w, h in capabilities.resolutions]
@@ -614,41 +675,79 @@ MJPG (Motion JPEG，推荐高帧率)
         device_index = int(device_str.split(":")[0])
         resolution_str = self.resolution_var.get()
         fps_str = self.fps_var.get()
-        
+
         width, height = map(int, resolution_str.split("×"))
         fps = float(fps_str)
-        
-        cap = cv2.VideoCapture(device_index, self.backend)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        
+
         eye_detector = EyeDetector() if self.eye_detection_var.get() else None
-        
+
+        # 尝试使用 SDK
+        using_sdk = False
+        if self.camera_capture:
+            try:
+                # 打开设备
+                if self.camera_capture.open_device(device_index):
+                    # 设置帧率
+                    self.camera_capture.set_frame_rate(device_index, int(fps))
+                    # 开始捕获
+                    if self.camera_capture.start_capture(device_index):
+                        using_sdk = True
+                        print(f"预览使用 SDK 模式")
+                    else:
+                        self.camera_capture.close_device(device_index)
+                else:
+                    print(f"SDK 打开设备失败，回退到 OpenCV")
+            except Exception as e:
+                print(f"SDK 预览初始化失败: {e}，回退到 OpenCV")
+
+        # OpenCV 备选方案
+        cap = None
+        if not using_sdk:
+            cap = cv2.VideoCapture(device_index, self.backend)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.set(cv2.CAP_PROP_FPS, fps)
+
         try:
             while self.preview_running:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
+                frame = None
+
+                if using_sdk:
+                    # 从 SDK 获取帧
+                    frame = self.camera_capture.get_frame(timeout=0.1)
+                else:
+                    # 从 OpenCV 获取帧
+                    if cap and cap.isOpened():
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+
+                if frame is None:
+                    continue
+
                 # 检测眼睛
                 if eye_detector:
                     frame, _ = eye_detector.detect(frame)
-                
+
                 # 缩放用于预览
                 preview_size = (640, 360)
                 frame_resized = cv2.resize(frame, preview_size)
-                
+
                 # 添加信息
-                info_text = f"{width}×{height} @ {fps:.0f} FPS"
+                mode_text = "SDK" if using_sdk else "OpenCV"
+                info_text = f"{mode_text}: {width}x{height} @ {fps:.0f} FPS"
                 cv2.putText(frame_resized, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
+
                 try:
                     self.frame_queue.put_nowait(frame_resized)
                 except queue.Full:
                     pass
         finally:
-            cap.release()
+            if using_sdk:
+                self.camera_capture.stop_capture(device_index)
+                self.camera_capture.close_device(device_index)
+            elif cap:
+                cap.release()
     
     def _update_preview_label(self) -> None:
         """更新预览标签。"""
@@ -715,11 +814,36 @@ MJPG (Motion JPEG，推荐高帧率)
 def run_capture(settings: CaptureSettings) -> bool:
     """使用给定参数录制视频。"""
     backend = get_camera_backend()
-    cap = cv2.VideoCapture(settings.device_index, backend)
-    
-    if not cap.isOpened():
-        print(f"❌ 错误：无法打开摄像头 {settings.device_index}", file=sys.stderr)
-        return False
+
+    # 尝试使用 SDK
+    camera_capture = UnifiedCameraCapture() if UnifiedCameraCapture else None
+    using_sdk = False
+
+    if camera_capture:
+        try:
+            if camera_capture.initialize():
+                if camera_capture.open_device(settings.device_index):
+                    camera_capture.set_frame_rate(settings.device_index, int(settings.fps))
+                    if camera_capture.start_capture(settings.device_index):
+                        using_sdk = camera_capture.is_using_sdk()  # 使用实际的SDK状态
+                        mode_text = "SDK" if using_sdk else "OpenCV"
+                        print(f"录制使用 {mode_text} 模式")
+                    else:
+                        camera_capture.close_device(settings.device_index)
+                else:
+                    print(f"SDK 打开设备失败，回退到 OpenCV")
+            else:
+                print(f"SDK 初始化失败，回退到 OpenCV")
+        except Exception as e:
+            print(f"SDK 录制初始化失败: {e}，回退到 OpenCV")
+
+    # OpenCV 备选方案
+    cap = None
+    if not using_sdk:
+        cap = cv2.VideoCapture(settings.device_index, backend)
+        if not cap.isOpened():
+            print(f"❌ 错误：无法打开摄像头 {settings.device_index}", file=sys.stderr)
+            return False
     
     # 给摄像头足够的初始化时间（某些驱动需要）
     print(f"等待摄像头初始化...")
@@ -731,40 +855,58 @@ def run_capture(settings: CaptureSettings) -> bool:
     
     # 【第1步】先尝试读取一帧（在设置任何参数前）
     print(f"[1/5] 测试原始读取 (无参数设置)...")
-    ret_test, frame_test = cap.read()
-    if ret_test:
-        print(f"   ✅ 原始读取成功，帧大小：{frame_test.shape}")
-        default_width = frame_test.shape[1]
-        default_height = frame_test.shape[0]
-        print(f"   💡 摄像头默认分辨率：{default_width}×{default_height}")
+    if using_sdk:
+        print(f"   SDK 模式：跳过 OpenCV 初始化测试")
+        ret_test = True  # SDK 模式下假设初始化成功
+        default_width = settings.width
+        default_height = settings.height
     else:
-        print(f"   ❌ 原始读取失败 - 摄像头驱动初始化问题")
-        print(f"   💡 建议：可能需要摄像头官方 SDK 支持")
+        ret_test, frame_test = cap.read()
+        if ret_test:
+            print(f"   ✅ 原始读取成功，帧大小：{frame_test.shape}")
+            default_width = frame_test.shape[1]
+            default_height = frame_test.shape[0]
+            print(f"   💡 摄像头默认分辨率：{default_width}×{default_height}")
+        else:
+            print(f"   ❌ 原始读取失败 - 摄像头驱动初始化问题")
+            print(f"   💡 建议：可能需要摄像头官方 SDK 支持")
     
     # 【第2步】设置分辨率和帧率
     print(f"\n[2/4] 设置参数...")
     print(f"   分辨率：{settings.width}×{settings.height}")
     print(f"   帧率：{settings.fps:.0f} FPS")
     print(f"   编码：{settings.fourcc}")
-    
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.height)
-    cap.set(cv2.CAP_PROP_FPS, settings.fps)
-    
-    # 尝试设置 FourCC（某些驱动需要这一步）
-    fourcc_test = cv2.VideoWriter_fourcc(*settings.fourcc)
-    cap.set(cv2.CAP_PROP_FOURCC, fourcc_test)
+
+    if using_sdk:
+        # SDK 已经设置了帧率，这里不需要额外设置分辨率
+        print(f"   SDK 模式：参数已通过 SDK 设置")
+    else:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.height)
+        cap.set(cv2.CAP_PROP_FPS, settings.fps)
+
+        # 尝试设置 FourCC（某些驱动需要这一步）
+        fourcc_test = cv2.VideoWriter_fourcc(*settings.fourcc)
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc_test)
     
     # 等待设置生效
     time.sleep(0.5)
     
     # 【第3步】验证参数是否生效
     print(f"\n[3/4] 验证参数...")
-    
-    # 读取实际参数
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if using_sdk:
+        # SDK 模式：使用 SDK 获取实际参数
+        actual_fps = camera_capture.get_frame_rate(settings.device_index)
+        # SDK 模式下分辨率信息可能不可用，使用设置值
+        actual_width = settings.width
+        actual_height = settings.height
+        print(f"   SDK 模式：使用 SDK 报告的参数")
+    else:
+        # 读取实际参数
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
     
     print(f"   分辨率：{settings.width}×{settings.height} → {actual_width}×{actual_height}", end="")
     if actual_width == settings.width and actual_height == settings.height:
@@ -784,43 +926,47 @@ def run_capture(settings: CaptureSettings) -> bool:
     
     # 【第4步】尝试读取一帧（设置参数后）
     print(f"\n[4/5] 测试参数下的读取...")
-    ret_test2, frame_test2 = cap.read()
-    if ret_test2:
-        print(f"   ✅ 参数设置后读取成功，帧大小：{frame_test2.shape}")
+    if using_sdk:
+        print(f"   SDK 模式：跳过参数测试")
+        ret_test2 = True
     else:
-        print(f"   ⚠️ 参数设置后读取失败，尝试恢复为默认格式...")
-        
-        # 尝试恢复到默认格式（不设置任何参数）
-        cap.release()
-        cap = cv2.VideoCapture(settings.device_index, backend)
-        time.sleep(1.0)
-        
-        ret_test3, frame_test3 = cap.read()
-        if ret_test3:
-            print(f"   ✅ 回到默认格式后读取成功！帧大小：{frame_test3.shape}")
-            # 使用默认分辨率
-            actual_width = frame_test3.shape[1]
-            actual_height = frame_test3.shape[0]
-            print(f"\n   💡 将使用默认参数录制：{actual_width}×{actual_height}")
+        ret_test2, frame_test2 = cap.read()
+        if ret_test2:
+            print(f"   ✅ 参数设置后读取成功，帧大小：{frame_test2.shape}")
         else:
-            print(f"   ❌ 连默认格式都无法读取！")
-            print(f"\n{'='*60}")
-            print(f"🔴 致命错误：摄像头完全无法初始化")
-            print(f"{'='*60}")
-            print(f"可能原因：")
-            print(f"1. 摄像头驱动程序问题")
-            print(f"2. 摄像头被其他应用独占")
-            print(f"3. USB 连接不稳定")
-            print(f"4. 缺少官方 SDK 支持")
-            print(f"\n排查步骤：")
-            print(f"1. 关闭 OBS、Zoom、FaceTime 等应用")
-            print(f"2. 运行：python3 detect_camera.py")
-            print(f"3. 检查系统偏好 > 隐私 > 摄像头权限")
-            print(f"4. 查找摄像头官方 SDK（可能需要）")
-            print(f"5. 重新插拔摄像头")
-            print(f"{'='*60}\n")
+            print(f"   ⚠️ 参数设置后读取失败，尝试恢复为默认格式...")
+
+            # 尝试恢复到默认格式（不设置任何参数）
             cap.release()
-            return False
+            cap = cv2.VideoCapture(settings.device_index, backend)
+            time.sleep(1.0)
+
+            ret_test3, frame_test3 = cap.read()
+            if ret_test3:
+                print(f"   ✅ 回到默认格式后读取成功！帧大小：{frame_test3.shape}")
+                # 使用默认分辨率
+                actual_width = frame_test3.shape[1]
+                actual_height = frame_test3.shape[0]
+                print(f"\n   💡 将使用默认参数录制：{actual_width}×{actual_height}")
+            else:
+                print(f"   ❌ 连默认格式都无法读取！")
+                print(f"\n{'='*60}")
+                print(f"🔴 致命错误：摄像头完全无法初始化")
+                print(f"{'='*60}")
+                print(f"可能原因：")
+                print(f"1. 摄像头驱动程序问题")
+                print(f"2. 摄像头被其他应用独占")
+                print(f"3. USB 连接不稳定")
+                print(f"4. 缺少官方 SDK 支持")
+                print(f"\n排查步骤：")
+                print(f"1. 关闭 OBS、Zoom、FaceTime 等应用")
+                print(f"2. 运行：python3 detect_camera.py")
+                print(f"3. 检查系统偏好 > 隐私 > 摄像头权限")
+                print(f"4. 查找摄像头官方 SDK（可能需要）")
+                print(f"5. 重新插拔摄像头")
+                print(f"{'='*60}\n")
+                cap.release()
+                return False
     
     # 【第5步】如果默认读取成功，跳过参数设置
     if ret_test:  # 第1步成功，使用默认格式
@@ -828,7 +974,10 @@ def run_capture(settings: CaptureSettings) -> bool:
         print(f"   📝 自动使用默认分辨率和帧率")
         actual_width = default_width
         actual_height = default_height
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        if using_sdk:
+            actual_fps = camera_capture.get_frame_rate(settings.device_index)
+        else:
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
         if actual_fps <= 0:
             actual_fps = settings.fps
     
@@ -869,6 +1018,12 @@ def run_capture(settings: CaptureSettings) -> bool:
         selected_codec = 'I420'
         print(f"ℹ️ 高分辨率 ({actual_width}×{actual_height})")
         print(f"   🔧 自动优化: MP4 容器 + I420 编码\n")
+    elif selected_codec in ['YUY2', 'UYVY', 'I420']:
+        # MP4 容器不支持 raw 格式，自动切换到 MJPEG
+        print(f"⚠️ MP4 容器不支持 {selected_codec} 编码")
+        selected_codec = 'MJPG'
+        print(f"   🔧 自动切换到 MJPEG 编码")
+        print(f"   📁 输出文件: {output_path}\n")
     
     # 创建 VideoWriter（使用实际获得的帧率）
     # 重要：必须用实际帧率而不是用户设置的帧率，否则视频会加速/减速
@@ -921,12 +1076,20 @@ def run_capture(settings: CaptureSettings) -> bool:
         last_time = start_time
         fps_samples = []
         bandwidth_samples = []
-        
+
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("摄像头读取失败，中止录制。")
-                break
+            if using_sdk:
+                frame = camera_capture.get_frame(timeout=0.1)
+                if frame is None:
+                    print("❌ SDK 摄像头读取失败，中止录制。")
+                    print("   💡 可能原因：SDK 连接问题或摄像头被其他应用占用")
+                    break
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    print("❌ OpenCV 摄像头读取失败，中止录制。")
+                    print("   💡 可能原因：摄像头驱动问题或连接不稳定")
+                    break
             
             # 计算实际传输的数据大小（帧大小）
             frame_bytes = frame.nbytes if hasattr(frame, 'nbytes') else frame.size
@@ -935,7 +1098,7 @@ def run_capture(settings: CaptureSettings) -> bool:
             if eye_detector:
                 frame, detection_info = eye_detector.detect(frame)
                 # 添加检测状态指示
-                status = "👁️ 已检测" if detection_info["detected"] else "👁️ 未检测"
+                status = "Eye: Detected" if detection_info["detected"] else "Eye: Not detected"
                 cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             writer.write(frame)
@@ -964,7 +1127,12 @@ def run_capture(settings: CaptureSettings) -> bool:
                 print("检测到退出指令，停止录制。")
                 break
     finally:
-        cap.release()
+        if using_sdk:
+            camera_capture.stop_capture(settings.device_index)
+            camera_capture.close_device(settings.device_index)
+            camera_capture.uninitialize()
+        elif cap:
+            cap.release()
         writer.release()
         cv2.destroyAllWindows()
         
