@@ -20,11 +20,12 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environments
+# Virtual Environment
 venv/
-env/
 ENV/
+env/
 .venv
+.conda/
 
 # IDEs
 .vscode/
@@ -32,44 +33,41 @@ ENV/
 *.swp
 *.swo
 *~
-
-# Model checkpoints
-checkpoints/
-*.pth
-*.pt
-*.pkl
-
-# Results
-results/
-*.png
-*.jpg
-
-# Logs
-*.log
-wandb/
-
-# Data (uncomment if you don't want to track data)
-MPIIGaze/
-
-# OS
 .DS_Store
-Thumbs.db
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Experiments
-experiments/
+# PyTorch
+*.pth
+*.pt
+!checkpoints/*.pth
+
+# Logs
+*.log
 logs/
+runs/
+wandb/
 
-# SDK
-sdk/MFC-demo/
+# Data
+MPIIGaze/Data/
+*.mat
+*.zip
+*.tar.gz
 
-# MPIIGaze
-MPIIGaze/
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Project specific
 archive.zip
-
-# capture mp4
-*.mp4
-*.avi
-*.mkv
+*.pdf
+test_*.py
+test_*.html
+*_test.py
+*_temp.py

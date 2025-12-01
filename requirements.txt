@@ -19,6 +19,16 @@ matplotlib>=3.5.0
 face-alignment>=1.3.5
 mediapipe>=0.8.0
 
+# GUI for visualization
+customtkinter>=5.0.0
+
+# Model export (for web deployment)
+# Uncomment if you need to export to TensorFlow.js:
+# onnx>=1.12.0
+# onnx-tf>=1.10.0
+# tensorflow>=2.10.0
+# tensorflowjs>=4.0.0
+
 # Optional: For better performance and additional features
 # Uncomment if needed:
 # tensorboard>=2.8.0  # For training visualization

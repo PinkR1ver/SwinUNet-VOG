@@ -14,8 +14,11 @@ import matplotlib
 # matplotlib.use('Agg') # Disable Agg backend to support interactive GUI
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from mpl_toolkits.mplot3d import Axes3D
 import scipy.signal
 from collections import deque
+import plistlib
+from datetime import datetime, timedelta
 
 # Add current directory to path to ensure imports work
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -94,10 +97,12 @@ class MediaPipeEyeNormalizer:
     RIGHT_EYE_BOTTOM = 145
     
     def __init__(self, eye: str = 'left', target_size: Tuple[int, int] = (36, 60),
-                 padding: float = 0.15, preprocessing_kwargs: Optional[dict] = None):
+                 padding: float = 0.15, preprocessing_kwargs: Optional[dict] = None,
+                 blink_window_extend_sec: float = 0.3):
         self.eye = eye.lower()
         self.target_size = target_size  # (H, W)
         self.padding = np.clip(padding, 0.05, 0.4)
+        self.blink_window_extend_sec = blink_window_extend_sec  # Time-based blink window extension
         
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -140,6 +145,9 @@ class MediaPipeEyeNormalizer:
         
         self.last_roi_tensor = None
         self.last_roi_display = None
+        
+        # Time-based blink tracking
+        self.blink_timestamps = []  # Store timestamps of detected blinks
 
     def _is_blinking(self, landmarks):
         """Calculate eye opening ratio to detect blinking."""
@@ -168,7 +176,17 @@ class MediaPipeEyeNormalizer:
         # Threshold: typically 0.15 - 0.25 indicates blinking
         return ratio < 0.20
 
-    def extract(self, frame_bgr: np.ndarray) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray], bool]:
+    def extract(self, frame_bgr: np.ndarray, timestamp: float = None) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray], bool]:
+        """
+        Extract eye ROI with time-based blink window extension.
+        
+        Args:
+            frame_bgr: Input frame in BGR format
+            timestamp: Current timestamp in seconds (required for time-based blink extension)
+            
+        Returns:
+            (roi_tensor, roi_display, is_in_blink_window)
+        """
         if frame_bgr is None or frame_bgr.size == 0:
             return None, None, False
             
@@ -180,24 +198,27 @@ class MediaPipeEyeNormalizer:
             
         landmarks = results.multi_face_landmarks[0].landmark
         
-        # Check blink
+        # Check if currently blinking
         is_blinking = self._is_blinking(landmarks)
         
-        # Blink Window Expansion (Dilate Blink Events)
-        # If currently blinking, extend the "blink state" slightly to cover
-        # the transition phases (closing/opening) which often have bad data.
-        
-        # Initialize history buffer for blink smoothing if not exists
-        if not hasattr(self, '_blink_history'):
-            self._blink_history = deque(maxlen=3) # Store last 3 frames blink status
-            
-        self._blink_history.append(is_blinking)
-        
-        # If ANY frame in recent history was blinking, consider this frame 'unstable/blinking'
-        # This expands the blink window forward. 
-        # To expand backward, we would need a delay, but for real-time forward expansion is safer.
-        # A simple "if any recent was blink" creates a hold-off period.
-        effective_blink = any(self._blink_history)
+        # Time-based Blink Window Expansion
+        if timestamp is not None:
+            # Check if current timestamp is within extended window of any pre-detected blink
+            # Window is SYMMETRIC: [blink_time - extend_sec, blink_time + extend_sec]
+            # This ensures we filter BOTH before and after the blink event
+            effective_blink = False
+            for blink_time in self.blink_timestamps:
+                time_diff = timestamp - blink_time
+                # Symmetric window: covers both before (-) and after (+) the blink
+                if -self.blink_window_extend_sec <= time_diff <= self.blink_window_extend_sec:
+                    effective_blink = True
+                    break
+        else:
+            # Fallback to frame-based if no timestamp provided (backward compatibility)
+            if not hasattr(self, '_blink_history'):
+                self._blink_history = deque(maxlen=3)
+            self._blink_history.append(is_blinking)
+            effective_blink = any(self._blink_history)
         
         h_img, w_img, _ = frame_bgr.shape
         
@@ -461,12 +482,44 @@ class GazeVisualizerApp(ctk.CTk):
             self.fps = cap.get(cv2.CAP_PROP_FPS)
             if self.fps <= 0: self.fps = 30.0
             
-            self.normalizer = MediaPipeEyeNormalizer(eye='left')
+            # Initialize normalizer with extended blink window (0.3 seconds = ±300ms around blink)
+            # This covers both full blinks and partial blinks (微闭) that affect gaze accuracy
+            self.normalizer = MediaPipeEyeNormalizer(eye='left', blink_window_extend_sec=0.3)
             
             # Clear cache for new video
             self.frame_cache = []
             
+            # ===== PHASE 1: Quick scan to detect all blink timestamps =====
+            print("[Phase 1] Scanning video for blink events...")
+            blink_timestamps = []
             frame_count = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                timestamp = frame_count / self.fps
+                frame_count += 1
+                
+                # Quick blink detection (no ROI extraction)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.normalizer.face_mesh.process(frame_rgb)
+                if results.multi_face_landmarks:
+                    landmarks = results.multi_face_landmarks[0].landmark
+                    if self.normalizer._is_blinking(landmarks):
+                        # Record blink timestamp (avoid duplicates within 100ms)
+                        if not blink_timestamps or (timestamp - blink_timestamps[-1]) > 0.1:
+                            blink_timestamps.append(timestamp)
+            
+            print(f"[Phase 1] Found {len(blink_timestamps)} blink events")
+            
+            # Pre-populate the normalizer's blink timestamps for symmetric window
+            self.normalizer.blink_timestamps = blink_timestamps
+            
+            # ===== PHASE 2: Full processing with blink windows =====
+            print("[Phase 2] Processing video with blink windows...")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
+            frame_count = 0
+            
             while self.is_processing:
                 ret, frame = cap.read()
                 if not ret:
@@ -476,8 +529,8 @@ class GazeVisualizerApp(ctk.CTk):
                 timestamp = frame_count / self.fps
                 frame_count += 1
                 
-                # Extract Eye
-                roi_tensor, roi_display, is_blinking = self.normalizer.extract(frame)
+                # Extract Eye (with pre-detected blink timestamps for symmetric window)
+                roi_tensor, roi_display, is_blinking = self.normalizer.extract(frame, timestamp)
                 
                 # Cache frame and eye image for later scrubbing
                 self.frame_cache.append((frame.copy(), roi_display.copy() if roi_display is not None else None))
@@ -659,23 +712,25 @@ class GazeVisualizerApp(ctk.CTk):
             colors = ['r', 'b']
             labels = ['Pitch', 'Yaw']
             
-            # Plot smoothed data (Full continuous line)
+            # Plot smoothed data with separate solid/dashed segments
             for i in range(2):
-                # Plot smoothed (Solid)
-                self.ax.plot(times, smoothed_angles[:, i], color=colors[i], linewidth=2, label=f'{labels[i]} smooth')
-                
-                # Plot Raw (Transparent)
+                # Plot Raw (Transparent background)
                 self.ax.plot(times, raw_angles[:, i], color=colors[i], alpha=0.2, linewidth=1, label=f'{labels[i]} raw')
                 
-                # Identify Blink Segments
+                # Identify Blink Segments (where raw data was NaN)
                 blink_mask = np.isnan(raw_angles[:, i])
+                
+                # Split smoothed data into non-blink (solid) and blink (dashed) segments
+                # Non-blink segments: solid line
+                non_blink_data = smoothed_angles[:, i].copy()
+                non_blink_data[blink_mask] = np.nan
+                self.ax.plot(times, non_blink_data, color=colors[i], linewidth=2, linestyle='-', label=f'{labels[i]} smooth')
+                
+                # Blink segments (interpolated): dashed line
                 if np.any(blink_mask):
-                    # Create a copy of smoothed data, set non-blink parts to NaN
-                    blink_segments = smoothed_angles[:, i].copy()
-                    blink_segments[~blink_mask] = np.nan
-                    
-                    # Plot blink segments as Dashed line on top
-                    self.ax.plot(times, blink_segments, color=colors[i], linestyle='--', linewidth=2, alpha=0.7)
+                    blink_data = smoothed_angles[:, i].copy()
+                    blink_data[~blink_mask] = np.nan
+                    self.ax.plot(times, blink_data, color=colors[i], linewidth=2, linestyle='--', alpha=0.8, label=f'{labels[i]} interp')
                 
             self.ax.legend(loc='upper right', fontsize='small')
             self.ax.grid(True, alpha=0.3)
@@ -692,6 +747,278 @@ class GazeVisualizerApp(ctk.CTk):
             # Connect events
             self.canvas.mpl_connect('button_press_event', self.on_plot_interaction)
             self.canvas.mpl_connect('motion_notify_event', self.on_plot_interaction)
+            
+            # Create 3D Gaze Vector Visualization Window
+            self.create_gaze_vector_window(smoothed_data)
+            
+            # Add Save button to export plist data
+            self.btn_save_plist = ctk.CTkButton(
+                self.win_gaze, 
+                text="💾 Save as Plist", 
+                command=lambda: self.save_to_plist(smoothed_data),
+                fg_color="green",
+                hover_color="darkgreen"
+            )
+            self.btn_save_plist.pack(pady=5)
+
+    def create_gaze_vector_window(self, smoothed_data):
+        """Create a window to visualize 3D gaze vector as arrow."""
+        self.win_gaze_vector = ctk.CTkToplevel(self)
+        self.win_gaze_vector.title("3D Gaze Vector Visualization")
+        self.win_gaze_vector.geometry("500x550")
+        
+        # Create matplotlib figure for 3D visualization
+        self.fig_3d = plt.Figure(figsize=(5, 5), dpi=100)
+        self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
+        
+        # Store smoothed data for vector visualization
+        self.smoothed_gaze_vectors = smoothed_data
+        
+        # Initial visualization (first frame)
+        self.update_gaze_vector_display(0)
+        
+        # Embed figure
+        self.canvas_3d = FigureCanvasTkAgg(self.fig_3d, master=self.win_gaze_vector)
+        self.canvas_3d.draw()
+        self.canvas_3d.get_tk_widget().pack(side="top", fill="both", expand=True)
+        
+        # Add info label
+        self.lbl_vector_info = ctk.CTkLabel(
+            self.win_gaze_vector, 
+            text="Gaze Vector: [0.00, 0.00, 0.00]", 
+            font=("Courier", 14)
+        )
+        self.lbl_vector_info.pack(pady=5)
+    
+    def update_gaze_vector_display(self, frame_idx):
+        """Update 3D gaze vector visualization for a specific frame."""
+        if not hasattr(self, 'ax_3d') or frame_idx >= len(self.smoothed_gaze_vectors):
+            return
+        
+        # Get gaze vector for this frame
+        gaze_vec = self.smoothed_gaze_vectors[frame_idx]
+        x, y, z = gaze_vec
+        
+        # Convert to Pitch and Yaw for visualization
+        pitch, yaw = self.vector_to_pitch_yaw(gaze_vec)
+        
+        # Clear and redraw
+        self.ax_3d.clear()
+        
+        # Set up 3D space with person and camera
+        # X: left-right (Yaw direction)
+        # Y: forward-backward (depth from person to camera)
+        # Z: up-down (Pitch direction)
+        self.ax_3d.set_xlim([-0.5, 0.5])
+        self.ax_3d.set_ylim([0, 1.2])
+        self.ax_3d.set_zlim([-0.3, 0.5])
+        self.ax_3d.set_xlabel('X (Left ← → Right)', fontsize=10)
+        self.ax_3d.set_ylabel('Y (Depth: Person → Camera)', fontsize=10, fontweight='bold')
+        self.ax_3d.set_zlabel('Z (Down ↓ ↑ Up)', fontsize=10)
+        self.ax_3d.set_title('Gaze Direction: Eye → Camera', fontsize=12, fontweight='bold')
+        
+        # Person position (eye center at origin)
+        person_x, person_y, person_z = 0, 0, 0
+        
+        # Draw person (head as sphere + body as cylinder)
+        # Head
+        self.ax_3d.scatter([person_x], [person_y], [person_z], 
+                          color='yellow', s=400, marker='o', 
+                          edgecolors='orange', linewidths=3, alpha=0.95, label='Person (Eye)')
+        # Simple body indicator
+        self.ax_3d.plot([person_x, person_x], [person_y, person_y], [person_z, person_z-0.2], 
+                       'orange', linewidth=6, alpha=0.7)
+        
+        # Camera position (at y=1.0, typical distance)
+        camera_x, camera_y, camera_z = 0, 1.0, 0
+        
+        # Draw camera (box + lens)
+        camera_size = 0.08
+        # Camera body (box)
+        camera_corners_x = [camera_x-camera_size, camera_x+camera_size, camera_x+camera_size, camera_x-camera_size, camera_x-camera_size]
+        camera_corners_z = [camera_z-camera_size, camera_z-camera_size, camera_z+camera_size, camera_z+camera_size, camera_z-camera_size]
+        camera_corners_y = [camera_y] * 5
+        self.ax_3d.plot(camera_corners_x, camera_corners_y, camera_corners_z, 
+                       'k-', linewidth=3, alpha=0.8)
+        # Camera lens (circle)
+        theta = np.linspace(0, 2*np.pi, 20)
+        lens_r = camera_size * 0.5
+        lens_x = camera_x + lens_r * np.cos(theta)
+        lens_z = camera_z + lens_r * np.sin(theta)
+        lens_y = [camera_y] * len(theta)
+        self.ax_3d.plot(lens_x, lens_y, lens_z, 'gray', linewidth=4, alpha=0.9)
+        self.ax_3d.scatter([camera_x], [camera_y], [camera_z], 
+                          color='darkblue', s=300, marker='s', 
+                          edgecolors='black', linewidths=3, alpha=0.9, label='Camera')
+        
+        # Draw ground plane for reference
+        xx, yy = np.meshgrid(np.linspace(-0.4, 0.4, 2), np.linspace(0, 1.1, 2))
+        zz = np.full_like(xx, -0.25)
+        self.ax_3d.plot_surface(xx, yy, zz, alpha=0.15, color='gray')
+        
+        # Draw reference line (person to camera center)
+        self.ax_3d.plot([person_x, camera_x], [person_y, camera_y], [person_z, camera_z], 
+                       'g--', linewidth=1.5, alpha=0.4, label='Center line (0°, 0°)')
+        
+        # Calculate gaze target point in 3D space
+        # Convert gaze vector (x, y, z) to 3D position
+        # Scale the unit vector to reach approximately camera distance
+        gaze_distance = 1.0  # Same as camera distance
+        gaze_target_x = person_x + x * gaze_distance
+        gaze_target_y = person_y + (-z) * gaze_distance  # -z because z points away from camera
+        gaze_target_z = person_z + (-y) * gaze_distance  # -y because y is down in gaze coords
+        
+        # Draw gaze vector as thick arrow from eye to target
+        self.ax_3d.quiver(
+            person_x, person_y, person_z,  # Start at eye
+            x * gaze_distance, (-z) * gaze_distance, (-y) * gaze_distance,  # Gaze direction
+            color='cyan',
+            alpha=0.95,
+            arrow_length_ratio=0.1,
+            linewidth=5,
+            label='Gaze Vector'
+        )
+        
+        # Mark the gaze target point
+        self.ax_3d.scatter([gaze_target_x], [gaze_target_y], [gaze_target_z], 
+                          color='red', s=250, marker='*', 
+                          edgecolors='white', linewidths=3, alpha=1.0,
+                          label=f'Gaze Target')
+        
+        # Draw line from gaze target to camera (to show offset)
+        self.ax_3d.plot([gaze_target_x, camera_x], [gaze_target_y, camera_y], [gaze_target_z, camera_z], 
+                       'yellow', linestyle=':', linewidth=2, alpha=0.6)
+        
+        # Add text annotation
+        annotation_text = f'Pitch: {pitch:.1f}° (Vertical)\n'
+        annotation_text += f'Yaw: {yaw:.1f}° (Horizontal)\n'
+        annotation_text += f'Vector: ({x:.3f}, {y:.3f}, {z:.3f})'
+        
+        # Determine gaze direction description
+        if abs(pitch) < 5 and abs(yaw) < 5:
+            direction = '👁️ Looking straight'
+        elif abs(yaw) > abs(pitch):
+            direction = f'Looking {"right" if yaw > 0 else "left"}'
+        else:
+            direction = f'Looking {"up" if pitch > 0 else "down"}'
+        annotation_text += f'\n{direction}'
+        
+        self.ax_3d.text2D(0.05, 0.95, annotation_text, transform=self.ax_3d.transAxes,
+                          fontsize=9, verticalalignment='top',
+                          bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
+        
+        # Set viewing angle (side view from 90° to see person-camera relationship)
+        # elev=10: slight elevation to see ground plane
+        # azim=90: viewing from the side (perpendicular to person-camera line)
+        self.ax_3d.view_init(elev=10, azim=90)
+        
+        self.ax_3d.legend(loc='lower left', fontsize=8, framealpha=0.9)
+        
+        # Update canvas
+        if hasattr(self, 'canvas_3d'):
+            self.canvas_3d.draw_idle()
+        
+        # Update info label
+        if hasattr(self, 'lbl_vector_info'):
+            if abs(pitch) < 5 and abs(yaw) < 5:
+                direction = '👁️ Looking straight'
+            elif abs(yaw) > abs(pitch):
+                direction = f'Looking {"right →" if yaw > 0 else "← left"}'
+            else:
+                direction = f'Looking {"up ↑" if pitch > 0 else "down ↓"}'
+            self.lbl_vector_info.configure(
+                text=f"Pitch: {pitch:.1f}° | Yaw: {yaw:.1f}° | {direction}"
+            )
+
+    def save_to_plist(self, smoothed_data):
+        """Save gaze data to plist format for further analysis."""
+        try:
+            # Ask user for save location
+            from tkinter import filedialog
+            default_filename = f"gaze_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.plist"
+            save_path = filedialog.asksaveasfilename(
+                defaultextension=".plist",
+                filetypes=[("Plist files", "*.plist"), ("All files", "*.*")],
+                initialfile=default_filename
+            )
+            
+            if not save_path:
+                return
+            
+            # Prepare data in plist format (matching your analysis code structure)
+            times = np.array(self.time_history)
+            raw_vectors = np.array(self.gaze_history)
+            
+            # Convert to angles
+            smoothed_angles = self.vector_to_pitch_yaw(smoothed_data)
+            
+            # Generate timestamp strings (similar to your HIT format)
+            base_time = datetime.now()
+            time_list = []
+            for t in times:
+                timestamp = base_time + timedelta(seconds=float(t))
+                time_list.append(timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])
+            
+            # Create plist data structure (compatible with your Streamlit analysis code)
+            plist_data = {
+                # Time data
+                'TimeList': time_list,
+                
+                # Eye movement data in degrees (matching your analysis code's expected format)
+                # Horizontal axis: Yaw (left-right eye movement)
+                'LeftEyeXDegList': smoothed_angles[:, 1].tolist(),  # Yaw angles
+                'RightEyeXDegList': smoothed_angles[:, 1].tolist(), # Same data for both eyes
+                
+                # Vertical axis: Pitch (up-down eye movement)
+                'LeftEyeYDegList': smoothed_angles[:, 0].tolist(),  # Pitch angles
+                'RightEyeYDegList': smoothed_angles[:, 0].tolist(), # Same data for both eyes
+                
+                # Also keep the original naming for reference
+                'GazePitchDegList': smoothed_angles[:, 0].tolist(),
+                'GazeYawDegList': smoothed_angles[:, 1].tolist(),
+                
+                # Raw gaze vectors (x, y, z) for advanced analysis
+                'GazeXList': smoothed_data[:, 0].tolist(),
+                'GazeYList': smoothed_data[:, 1].tolist(),
+                'GazeZList': smoothed_data[:, 2].tolist(),
+                
+                # Metadata
+                'VideoFile': os.path.basename(self.video_path) if self.video_path else 'unknown',
+                'FPS': float(self.fps) if hasattr(self, 'fps') else 30.0,
+                'TotalFrames': len(times),
+                'Duration': float(times[-1]) if len(times) > 0 else 0.0,
+                'ProcessingDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                
+                # Processing parameters
+                'BlinkWindowSec': 0.3,
+                'FilteredData': True,
+                'CoordinateSystem': 'MPIIGaze',
+                
+                # Additional info
+                'Description': 'Gaze estimation data from SwinUNet-VOG - Compatible with pVestibular analysis',
+                'DataFormat': 'Eye angles in degrees, compatible with LeftEyeXDegList/LeftEyeYDegList format',
+                'PitchRange': '[-25, 45] degrees (vertical)',
+                'YawRange': '[-45, 45] degrees (horizontal)',
+            }
+            
+            # Save to plist file
+            with open(save_path, 'wb') as f:
+                plistlib.dump(plist_data, f)
+            
+            # Show success message
+            if hasattr(self, 'label_status'):
+                self.label_status.configure(
+                    text=f"✅ Data saved to: {os.path.basename(save_path)}"
+                )
+            
+            print(f"[Save] Plist data saved successfully to: {save_path}")
+            print(f"[Save] Total frames: {len(times)}, Duration: {times[-1]:.2f}s")
+            
+        except Exception as e:
+            error_msg = f"Error saving plist: {str(e)}"
+            print(f"[Save Error] {error_msg}")
+            if hasattr(self, 'label_status'):
+                self.label_status.configure(text=f"❌ {error_msg}")
 
     def on_plot_interaction(self, event):
         """Handle mouse clicks and drags on the plot."""
@@ -730,6 +1057,10 @@ class GazeVisualizerApp(ctk.CTk):
                 if hasattr(self, 'win_eye') and self.win_eye.winfo_exists():
                     self.lbl_eye_img.configure(image=ctk_img)
                     self.lbl_eye_img.image = ctk_img
+        
+        # Update 3D Gaze Vector View
+        if hasattr(self, 'ax_3d'):
+            self.update_gaze_vector_display(idx)
         
         # Update Video View (Slower, maybe skip if dragging too fast?)
         # For now, just do it.

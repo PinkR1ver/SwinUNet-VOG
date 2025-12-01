@@ -1,0 +1,8 @@
+{
+  "total_epochs": 50,
+  "best_val_angle": 5.736301347857616,
+  "final_train_loss": 0.00037996633394483655,
+  "final_val_loss": 0.004973420167158618,
+  "final_train_angle": 1.5667635143673333,
+  "final_val_angle": 5.964210264018325
+}

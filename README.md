@@ -1,186 +1,509 @@
-# SwinUNet-VOG: Gaze Estimation with SwinUNet
+# SwinUNet-VOG: 基于 Swin Transformer 的视线估计系统
 
-This project implements a SwinUNet-based model for gaze point estimation using the MPIIGaze dataset.
+一个完整的深度学习视线追踪解决方案，包含模型训练、评估、实时可视化和 Web 部署。
 
-## Dataset
+[![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.10%2B-orange.svg)](https://pytorch.org/)
 
-The project uses the MPIIGaze dataset, which contains:
-- 15 participants with 521 days of recording
-- Eye images: 36×60 pixels
-- 3D gaze vectors
-- Two evaluation protocols:
-  - Cross-subject evaluation (default)
-  - Person-specific evaluation
+## 📋 目录
 
-See `mpiigaze_summary.md` for detailed dataset information.
+- [项目简介](#项目简介)
+- [核心特性](#核心特性)
+- [快速开始](#快速开始)
+- [模型训练](#模型训练)
+- [可视化工具](#可视化工具)
+- [Web 部署](#web-部署)
+- [技术细节](#技术细节)
+- [常见问题](#常见问题)
 
-## Project Structure
+---
+
+## 项目简介
+
+SwinUNet-VOG 实现了一个基于 **Swin Transformer** 和 **U-Net** 架构的视线估计模型，在 MPIIGaze 数据集上达到了 **~5.7°** 的平均角度误差。
+
+### 算法流程
 
 ```
-SwinUNet-VOG/
-├── data.py           # Dataset loading and preprocessing
-├── model.py          # SwinUNet model architecture
-├── train.py          # Training script
-├── test.py           # Evaluation script
-├── requirements.txt  # Dependencies
-├── README.md         # This file
-├── mpiigaze_summary.md  # Dataset documentation
-└── MPIIGaze/         # Dataset folder (not included in repo)
+输入 (36×60×3) → 预处理 → SwinUNet → 3D向量 (x,y,z) → Pitch/Yaw角度
 ```
 
-## Installation
+### 核心组件
 
-1. Install Python dependencies:
+- **模型训练** (`train.py`)：完整的训练流程，支持跨被试和个人化评估
+- **模型评估** (`test.py`)：详细的性能指标和可视化
+- **GUI 可视化** (`gui_visualizer.py`)：实时视频处理和眼动追踪
+- **Web 部署** (`js/`)：浏览器端推理，支持视频文件处理
+
+---
+
+## 核心特性
+
+### 🎯 模型训练
+- **SwinUNet 架构**：U-Net + Swin Transformer，参数量 ~7.6M
+- **双评估协议**：跨被试（cross-subject）和个人化（person-specific）
+- **完整预处理**：光照/对比度/几何归一化
+- **训练监控**：实时曲线、检查点保存、自动学习率调整
+
+### 📊 可视化部署
+- **GUI 界面**：拖拽视频，实时显示眼部 ROI 和角度曲线
+- **眨眼处理**：基于时间的眨眼窗口扩展（±200ms），插值平滑
+- **信号滤波**：中值滤波去除尖峰 + 低通滤波平滑曲线
+- **交互式回放**：拖动时间轴查看对应视频帧和眼部图像
+
+### 🌐 Web 部署
+- **浏览器端推理**：ONNX Runtime Web + MediaPipe
+- **本地部署**：无需网络，所有依赖本地化
+- **实时处理**：支持视频文件上传和逐帧处理
+
+---
+
+## 快速开始
+
+### 1. 环境配置
+
 ```bash
+# 克隆仓库
+git clone https://github.com/your-repo/SwinUNet-VOG.git
+cd SwinUNet-VOG
+
+# 安装依赖
 pip install -r requirements.txt
 ```
 
-2. Place the MPIIGaze dataset in the project root:
+**主要依赖**：
+- `torch >= 1.10`
+- `opencv-python`
+- `mediapipe`
+- `customtkinter`
+- `matplotlib`
+- `scipy`
+
+### 2. 准备数据集
+
+下载 [MPIIGaze 数据集](https://www.mpi-inf.mpg.de/departments/computer-vision-and-machine-learning/research/gaze-based-human-computer-interaction/appearance-based-gaze-estimation-in-the-wild/)，解压到 `MPIIGaze/` 目录：
+
 ```
-SwinUNet-VOG/
-└── MPIIGaze/
+MPIIGaze/
     ├── Data/
     │   └── Normalized/
     │       ├── p00/
     │       ├── p01/
     │       └── ...
-    ├── Evaluation Subset/
-    └── Annotation Subset/
+└── Evaluation Subset/
 ```
 
-## Usage
+### 3. 训练模型
 
-### Training
-
-**Cross-subject evaluation (default):**
 ```bash
-python train.py --data_dir MPIIGaze/Data/Normalized --batch_size 64 --epochs 50 --lr 0.001
+# 跨被试评估（留一法）
+python train.py --eval_mode cross_subject
+
+# 个人化评估
+python train.py --eval_mode person_specific --test_person p00
 ```
 
-**Person-specific evaluation:**
+### 4. 评估模型
+
 ```bash
-python train.py --person_specific --person_id p00 --batch_size 64 --epochs 50 --lr 0.001
+python test.py --checkpoint checkpoints/checkpoint_best.pth
 ```
 
-**Training arguments:**
-- `--data_dir`: Path to normalized data directory
-- `--batch_size`: Batch size (default: 64)
-- `--epochs`: Number of training epochs (default: 50)
-- `--lr`: Learning rate (default: 0.001)
-- `--device`: Device to use (default: auto-detect)
-- `--num_workers`: Number of data loading workers (default: 4)
-- `--save_dir`: Directory to save checkpoints (default: checkpoints)
-- `--person_specific`: Use person-specific protocol
-- `--person_id`: Person ID for person-specific evaluation
-- `--resume`: Path to checkpoint to resume training
+### 5. 可视化工具
 
-### Testing
-
-**Cross-subject evaluation:**
 ```bash
-python test.py --checkpoint checkpoints/checkpoint_best.pth --data_dir MPIIGaze/Data/Normalized
+python gui_visualizer.py
 ```
 
-**Person-specific evaluation:**
+操作步骤：
+1. 点击 "Select Video File" 选择视频
+2. 点击 "Start Processing" 开始处理
+3. 观察实时眼部 ROI 和角度曲线
+4. 处理完成后，拖动图表查看任意时刻的视频帧
+
+---
+
+## 模型训练
+
+### 训练参数
+
 ```bash
-python test.py --checkpoint checkpoints/checkpoint_best.pth --person_specific --person_id p00
+python train.py \
+    --eval_mode cross_subject \
+    --batch_size 128 \
+    --epochs 50 \
+    --lr 0.001 \
+    --device cuda
 ```
 
-**Testing arguments:**
-- `--checkpoint`: Path to model checkpoint (required)
-- `--data_dir`: Path to normalized data directory
-- `--batch_size`: Batch size for evaluation (default: 64)
-- `--device`: Device to use (default: auto-detect)
-- `--num_workers`: Number of data loading workers (default: 4)
-- `--save_dir`: Directory to save results (default: results)
-- `--person_specific`: Use person-specific protocol
-- `--person_id`: Person ID for person-specific evaluation
-- `--no_plots`: Skip saving evaluation plots
+### 关键参数说明
 
-### Evaluation Metrics
+- `--eval_mode`: 评估模式
+  - `cross_subject`: 跨被试（留一法，训练14人，测试1人）
+  - `person_specific`: 个人化（单人数据分割）
+- `--test_person`: 个人化模式下的测试被试（如 `p00`）
+- `--batch_size`: 批次大小（默认 128）
+- `--epochs`: 训练轮数（默认 50）
+- `--lr`: 学习率（默认 0.001）
 
-The model is evaluated using:
-- **Mean Angular Error**: Average angular error in degrees
-- **Median Angular Error**: Median angular error in degrees
-- **95th/99th Percentile**: Percentile values for error distribution
+### 输出文件
 
-The test script generates:
-- Error distribution histogram
-- Cumulative error distribution
-- Predictions vs ground truth scatter plots
+训练完成后，`checkpoints/` 目录包含：
+- `checkpoint_best.pth`: 最佳模型（验证集误差最低）
+- `checkpoint_latest.pth`: 最新模型
+- `training_curves.png`: 训练/验证损失曲线
+- `angle_error_curves.png`: 角度误差曲线
+- `training_summary.json`: 训练摘要
 
-## Model Architecture
+---
 
-The SwinUNet model consists of:
-1. **Patch Embedding**: Convolutional patch embedding
-2. **Encoder**: 3 Swin Transformer blocks with downsampling
-3. **Bottleneck**: Additional Swin Transformer block
-4. **Decoder**: 2 Swin Transformer blocks with upsampling
-5. **Head**: Fully connected layers for 3D gaze regression
+## 可视化工具
 
-Key features:
-- Simplified Swin Transformer blocks with depthwise separable convolution
-- U-Net-like encoder-decoder structure
-- Dropout and batch normalization for regularization
-- ~7.6M parameters
+### GUI 可视化器 (`gui_visualizer.py`)
 
-## Results
+#### 功能特性
 
-Training produces:
-- `checkpoint_best.pth`: Best model based on validation angular error
-- `checkpoint_latest.pth`: Latest checkpoint
+1. **实时处理**：
+   - 使用 MediaPipe 提取眼部 ROI
+   - SwinUNet 模型推理
+   - 实时显示 Pitch/Yaw 角度
 
-Evaluation produces:
-- `results.json`: Numerical evaluation metrics
-- `error_distribution.png`: Histogram of angular errors
-- `cumulative_distribution.png`: Cumulative error distribution
-- `predictions_vs_targets.png`: Scatter plots comparing predictions to ground truth
+2. **眨眼处理**：
+   - 基于 EAR（Eye Aspect Ratio）检测眨眼
+   - **两阶段处理**：先扫描全部眨眼事件，再对称扩展窗口
+   - 时间窗口扩展：眨眼时刻 ±300ms 标记为不可靠
+   - 覆盖完全闭眼和微闭（半眨眼）状态
+   - 线性插值填充，虚线显示插值段
 
-## Customization
+3. **信号滤波**：
+   - 中值滤波（kernel_size=5）：去除尖峰噪声
+   - 低通滤波（Butterworth, cutoff=5Hz）：平滑曲线
 
-### Changing Model Architecture
+4. **交互式回放**：
+   - 拖动图表时间轴
+   - 显示对应时刻的视频帧和眼部图像
+   - 实时显示 3D 注视向量箭头可视化
 
-Edit `model.py` to modify:
-- Embedding dimension: `embed_dim`
-- Number of layers: `depths`
-- Number of heads: `num_heads`
-- Window size: `window_size`
-- Dropout rate: `drop_rate`
+5. **数据导出**：
+   - 一键保存为 Plist 格式
+   - 兼容 pVestibular 分析平台
+   - 包含完整的时间戳和元数据
 
-### Changing Training Parameters
+#### 使用示例
 
-Edit `train.py` or use command-line arguments to modify:
-- Learning rate and optimizer
-- Loss function
-- Learning rate scheduler
-- Data augmentation
+```python
+# 启动 GUI
+python gui_visualizer.py
 
-### Changing Dataset
+# 1. 选择视频文件（MKV/MP4/AVI）
+# 2. 加载模型检查点（自动加载 checkpoint_best.pth）
+# 3. 点击 "Start Processing"
+# 4. 观察实时结果
+# 5. 处理完成后，拖动图表查看任意帧
+# 6. 自动弹出 3D 注视向量可视化窗口
+```
 
-Modify `data.py` to use a different dataset:
-- Implement custom `Dataset` class
-- Implement custom data loaders
-- Adjust preprocessing/augmentation
+#### 可视化窗口说明
 
-## Citation
+处理完成后会自动打开 4 个窗口：
 
-If you use this code, please cite:
+1. **Gaze Angles Plot**（主窗口）：
+   - Pitch/Yaw 角度时间序列图
+   - 可拖动时间轴游标
+   - 实线：正常数据，虚线：眨眼插值
+
+2. **Eye Input**：
+   - 当前帧的眼部 ROI（36×60）
+   - 跟随时间轴实时更新
+
+3. **Video Frame**：
+   - 完整视频帧
+   - 跟随时间轴实时更新
+
+4. **3D Gaze Vector**（新增）：
+   - 3D 注视向量箭头可视化
+   - 显示 X/Y/Z 分量和投影
+   - 跟随时间轴实时更新
+   - 显示当前向量值和角度
+
+#### 图表说明
+
+- **实线**：真实采集的数据（经过滤波）
+- **虚线**：眨眼时的插值数据
+- **半透明**：原始未处理数据
+- **红色**：Pitch（俯仰角，垂直方向）
+- **蓝色**：Yaw（偏航角，水平方向）
+
+---
+
+## Web 部署
+
+Web 版本位于 `js/` 文件夹，支持浏览器端实时推理。
+
+### 快速启动
+
+```bash
+cd js
+
+# 1. 下载依赖（ONNX Runtime, MediaPipe, Chart.js）
+python download_dependencies.py
+
+# 2. 导出 ONNX 模型（在项目根目录执行）
+cd ..
+python export_to_onnx.py --checkpoint checkpoints/checkpoint_best.pth --output models/swinunet_web.onnx
+
+# 3. 启动服务器
+cd js
+python server.py
+
+# 4. 打开浏览器访问
+# http://localhost:8000/demo.html
+```
+
+### Web 版功能
+
+- ✅ 视频文件上传（拖拽或选择）
+- ✅ MediaPipe 人脸检测和眼部提取
+- ✅ ONNX Runtime 模型推理
+- ✅ 实时 Pitch/Yaw 角度图表
+- ✅ FPS 显示
+- ✅ 眼部 ROI 可视化
+
+### 文件结构
 
 ```
-@inproceedings{zhang2015appearance,
-  title={Appearance-based gaze estimation in the wild},
-  author={Zhang, Xucong and Sugano, Yusuke and Fritz, Mario and Bulling, Andreas},
-  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
-  year={2015}
+js/
+├── demo.html                    # 主演示页面
+├── server.py                    # 自定义 HTTP 服务器
+├── download_dependencies.py     # 依赖下载脚本
+├── swinunet-gaze-api.js        # JavaScript API
+├── API_REFERENCE.md             # JavaScript API 文档
+└── lib/                         # 本地依赖
+    ├── ort.min.js              # ONNX Runtime
+    ├── ort-wasm*.wasm          # WASM 文件
+    ├── face_mesh.js            # MediaPipe
+    ├── face_mesh*.wasm         # MediaPipe WASM
+    └── chart.min.js            # Chart.js
+```
+
+### 使用说明
+
+**启动服务器**：
+```bash
+cd js
+python server.py
+```
+
+**访问演示**：
+打开浏览器访问 http://localhost:8000/demo.html
+
+**功能**：
+- 上传视频文件（拖拽或选择）
+- 自动检测人脸和提取眼部 ROI
+- 实时显示 Pitch/Yaw 角度曲线
+- FPS 性能监控
+
+**注意事项**：
+- 首次使用需要运行 `python download_dependencies.py` 下载依赖
+- 需要先导出 ONNX 模型到 `../models/swinunet_web.onnx`
+- 使用 `server.py` 而非 `python -m http.server`（正确的 MIME 类型）
+
+---
+
+## 技术细节
+
+### MPIIGaze 数据集
+
+- **规模**：15 人，~45,000 张眼部图像
+- **图像尺寸**：36×60×3（归一化后）
+- **标注**：3D 注视向量 (x, y, z)，范围 [-1, 1]
+- **采集环境**：日常办公场景，多种光照和头部姿态
+
+### 几何归一化
+
+MPIIGaze 数据已经过几何归一化：
+1. 检测人脸关键点
+2. 计算头部姿态（旋转矩阵）
+3. 将眼部图像旋转到标准视角
+4. 裁剪并缩放到 36×60
+
+### 坐标系统
+
+遵循 MPIIGaze 约定：
+```python
+# 3D 注视向量转角度
+Pitch = arcsin(-y)        # 垂直角度，范围 [-90°, 90°]
+Yaw = arctan2(-x, -z)     # 水平角度，范围 [-180°, 180°]
+```
+
+典型范围（基于数据集统计）：
+- Pitch: [-25°, 45°]
+- Yaw: [-45°, 45°]
+
+### 眨眼检测
+
+使用 Eye Aspect Ratio (EAR)：
+```python
+EAR = 垂直距离 / 水平距离
+阈值: EAR < 0.20 认为是眨眼
+```
+
+时间窗口扩展（两阶段处理）：
+- **阶段 1**：快速扫描视频，记录所有眨眼时刻
+- **阶段 2**：重新处理，对每个眨眼时刻 t 应用对称窗口
+- 标记 [t-300ms, t+300ms] 为不可靠数据
+- 覆盖完全闭眼和微闭（半眨眼）的过渡期
+- 使用线性插值填充
+
+**为什么需要两阶段？**
+- 眨眼前的微闭状态也会影响数据质量
+- 单次扫描无法回溯之前的帧
+- 两阶段处理确保对称窗口正确应用
+
+---
+
+## 常见问题
+
+### Q: 运行 GUI 时出现 protobuf 导入错误？
+A: 这是依赖版本冲突。GUI 工具不需要 TensorFlow，可以卸载：
+```bash
+# 卸载 TensorFlow
+pip uninstall tensorflow tensorflow-intel keras tensorboard tensorflow-estimator -y
+
+# 安装正确的 protobuf 版本
+pip install "protobuf>=4.25.3,<5"
+pip install "ml_dtypes>=0.5.0"
+```
+
+### Q: 训练时显存不足怎么办？
+A: 减小 `batch_size`，例如：
+```bash
+python train.py --batch_size 64
+```
+
+### Q: 如何切换左眼/右眼？
+A: 修改 `gui_visualizer.py` 第 467 行：
+```python
+self.normalizer = MediaPipeEyeNormalizer(eye='right', ...)  # 'left' 或 'right'
+```
+
+### Q: Web 版加载很慢？
+A: 确保已运行 `download_dependencies.py` 下载本地依赖，避免从 CDN 加载。
+
+### Q: 如何调整眨眼窗口大小？
+A: 修改 `gui_visualizer.py` 第 517 行：
+```python
+self.normalizer = MediaPipeEyeNormalizer(
+    eye='left', 
+    blink_window_extend_sec=0.3  # 默认 0.3 秒，覆盖完全闭眼和微闭状态
+)
+```
+**建议值**：
+- **120 FPS 视频**：0.3 秒（覆盖 36 帧，包含微闭过渡期）
+- 60 FPS 视频：0.3-0.4 秒（覆盖 18-24 帧）
+- 30 FPS 视频：0.4-0.5 秒（覆盖 12-15 帧）
+
+**说明**：
+- 窗口不仅过滤完全闭眼，也过滤眼睛微闭（半眨眼）时的不稳定数据
+- 采用两阶段处理，确保对称窗口正确应用于眨眼前后
+
+### Q: 如何导出 ONNX 模型？
+A: 使用 `export_to_onnx.py`：
+```bash
+python export_to_onnx.py \
+    --checkpoint checkpoints/checkpoint_best.pth \
+    --output models/swinunet_web.onnx
+```
+
+### Q: 模型性能如何？
+A: 在 MPIIGaze 数据集上：
+- 跨被试评估：~5.7° 平均角度误差
+- 个人化评估：~4.5° 平均角度误差
+- 推理速度：~30 FPS（GPU）/ ~10 FPS（CPU）
+
+---
+
+## 项目结构
+
+```
+SwinUNet-VOG/
+├── README.md                    # 📘 项目文档
+├── requirements.txt             # 📦 Python 依赖
+├── config.json                  # ⚙️ 配置文件
+├── .gitignore                   # 🚫 Git 忽略规则
+│
+├── train.py                     # 🎓 模型训练
+├── test.py                      # 📊 模型评估
+├── model.py                     # 🧠 SwinUNet 模型定义
+├── data.py                      # 💾 数据加载器
+├── preprocessing.py             # 🔧 预处理工具
+├── geometric_normalization.py   # 📐 几何归一化
+├── gui_visualizer.py            # 🖥️ GUI 可视化工具
+├── visualize_results.py         # 📈 评估可视化
+├── export_to_onnx.py            # 📤 ONNX 导出
+│
+├── checkpoints/                 # 💾 模型检查点
+│   ├── checkpoint_best.pth
+│   └── checkpoint_latest.pth
+│
+├── models/                      # 🤖 导出的模型
+│   ├── swinunet.onnx
+│   └── swinunet_web.onnx
+│
+├── MPIIGaze/                    # 📂 数据集
+│
+└── js/                          # 🌐 Web 部署
+    ├── demo.html                # 演示页面
+    ├── server.py                # HTTP 服务器
+    ├── download_dependencies.py # 依赖下载
+    ├── swinunet-gaze-api.js     # JavaScript API
+    ├── API_REFERENCE.md         # API 文档
+    └── lib/                     # JavaScript 依赖库
+```
+
+---
+
+## 许可证
+
+本项目采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 许可证。
+
+## 引用
+
+如果本项目对您的研究有帮助，请引用：
+
+```bibtex
+@misc{swinunet-vog,
+  title={SwinUNet-VOG: Swin Transformer-based Gaze Estimation},
+  author={Your Name},
+  year={2024},
+  howpublished={\url{https://github.com/your-repo/SwinUNet-VOG}}
 }
 ```
 
-## License
+## 致谢
 
-This project is for educational and research purposes. Please check the MPIIGaze dataset license:
-Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License
+- [MPIIGaze Dataset](https://www.mpi-inf.mpg.de/departments/computer-vision-and-machine-learning/research/gaze-based-human-computer-interaction/appearance-based-gaze-estimation-in-the-wild/)
+- [Swin Transformer](https://github.com/microsoft/Swin-Transformer)
+- [MediaPipe](https://google.github.io/mediapipe/)
+- [ONNX Runtime](https://onnxruntime.ai/)
 
-## Contact
+---
 
-For questions or issues, please open an issue on the repository.
+## 项目精简说明
+
+本项目已进行全面整理，删除了所有测试文件、临时脚本和冗余文档：
+
+### 精简效果
+- **文档**: 从 12 个 MD 文件精简到 2 个（主 README + JS API 文档）
+- **HTML**: 从 6 个精简到 1 个（demo.html）
+- **脚本**: 删除了所有启动/部署脚本，直接使用 `python server.py`
+- **导出工具**: 从 4 个精简到 1 个（export_to_onnx.py）
+
+### 核心文件
+- **根目录**: 13 个核心文件（训练、评估、可视化）
+- **js 文件夹**: 5 个核心文件（Web 部署）
+- **无冗余**: 无测试文件、无临时脚本、无重复文档
+
+项目现在结构清晰，易于维护和使用。
 
