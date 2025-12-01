@@ -323,9 +323,33 @@ class GazeVisualizerApp(ctk.CTk):
         self.label_status = ctk.CTkLabel(self.main_frame, text="Ready", text_color="gray")
         self.label_status.grid(row=2, column=0, pady=10)
         
+        # Options frame
+        self.frame_options = ctk.CTkFrame(self.main_frame)
+        self.frame_options.grid(row=3, column=0, pady=10)
+        
+        # Animation option
+        self.animation_var = ctk.BooleanVar(value=False)
+        self.chk_animation = ctk.CTkCheckBox(
+            self.frame_options, 
+            text="🎬 Enable Real-time Animation (slower)", 
+            variable=self.animation_var,
+            font=("Arial", 13)
+        )
+        self.chk_animation.pack(pady=5)
+        
+        # 3D Gaze Vector option
+        self.show_3d_var = ctk.BooleanVar(value=True)
+        self.chk_3d_gaze = ctk.CTkCheckBox(
+            self.frame_options, 
+            text="🎯 Show 3D Gaze Vector Window", 
+            variable=self.show_3d_var,
+            font=("Arial", 13)
+        )
+        self.chk_3d_gaze.pack(pady=5)
+        
         # Controls
         self.frame_controls = ctk.CTkFrame(self.main_frame)
-        self.frame_controls.grid(row=3, column=0, pady=20)
+        self.frame_controls.grid(row=4, column=0, pady=20)
         
         self.btn_start = ctk.CTkButton(self.frame_controls, text="Start Processing", command=self.start_processing, state="disabled")
         self.btn_start.pack(side="left", padx=10)
@@ -335,9 +359,9 @@ class GazeVisualizerApp(ctk.CTk):
         
         # Checkpoint selection
         self.btn_ckpt = ctk.CTkButton(self.main_frame, text="Load Checkpoint", command=self.select_checkpoint, width=100)
-        self.btn_ckpt.grid(row=4, column=0, pady=10)
+        self.btn_ckpt.grid(row=5, column=0, pady=10)
         self.label_ckpt = ctk.CTkLabel(self.main_frame, text="No checkpoint loaded", font=("Arial", 10))
-        self.label_ckpt.grid(row=5, column=0)
+        self.label_ckpt.grid(row=6, column=0)
 
     def load_default_checkpoint(self):
         possible_paths = [
@@ -419,52 +443,87 @@ class GazeVisualizerApp(ctk.CTk):
         self.btn_select.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         
-        # Initialize history and plot
+        # Initialize history
         self.gaze_history = []
         self.start_time = time.time()
         self.time_history = []
         self.eye_history = [] # Cache processed eye images for review
         self.frame_index_history = [] # Map time to frame index
         
-        self.fig = plt.figure(figsize=(5, 4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Gaze Angles over Time")
-        self.ax.set_ylim(-25, 45) # Optimized range based on MPIIGaze statistics
-        self.ax.set_xlabel("Video Time (s)")
-        self.ax.set_ylabel("Angle (degrees)")
+        # Check if animation mode is enabled
+        self.enable_animation = self.animation_var.get()
         
-        self.lines = []
-        colors = ['r', 'b']
-        labels = ['Pitch (Vertical)', 'Yaw (Horizontal)']
-        for i in range(2):
-            line, = self.ax.plot([], [], color=colors[i], label=labels[i])
-            self.lines.append(line)
-        self.ax.legend(loc='upper right')
-        self.ax.grid(True, alpha=0.3)
-        
-        # Create Popup Windows
-        self.win_eye = ctk.CTkToplevel(self)
-        self.win_eye.title("Extracted Eye Input")
-        self.win_eye.geometry("300x200")
-        self.lbl_eye_img = ctk.CTkLabel(self.win_eye, text="")
-        self.lbl_eye_img.pack(expand=True, fill="both")
-        
-        self.win_gaze = ctk.CTkToplevel(self)
-        self.win_gaze.title("Gaze Prediction")
-        self.win_gaze.geometry("600x550") # Increased height for toolbar
-        
-        # Embed Matplotlib Figure
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.win_gaze)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-        
-        # Add Toolbar
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self.win_gaze)
-        self.toolbar.update()
-        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
-        
-        self.lbl_gaze_val = ctk.CTkLabel(self.win_gaze, text="Gaze: [0.00, 0.00, 0.00]", font=("Courier", 16))
-        self.lbl_gaze_val.pack(pady=5)
+        if self.enable_animation:
+            # Create real-time visualization windows
+            self.fig = plt.figure(figsize=(5, 4), dpi=100)
+            self.ax = self.fig.add_subplot(111)
+            self.ax.set_title("Gaze Angles over Time (Real-time)")
+            self.ax.set_ylim(-25, 45)
+            self.ax.set_xlabel("Video Time (s)")
+            self.ax.set_ylabel("Angle (degrees)")
+            
+            self.lines = []
+            colors = ['r', 'b']
+            labels = ['Pitch (Vertical)', 'Yaw (Horizontal)']
+            for i in range(2):
+                line, = self.ax.plot([], [], color=colors[i], label=labels[i])
+                self.lines.append(line)
+            self.ax.legend(loc='upper right')
+            self.ax.grid(True, alpha=0.3)
+            
+            # Create Popup Windows
+            self.win_eye = ctk.CTkToplevel(self)
+            self.win_eye.title("Extracted Eye Input (Real-time)")
+            self.win_eye.geometry("300x200")
+            self.lbl_eye_img = ctk.CTkLabel(self.win_eye, text="")
+            self.lbl_eye_img.pack(expand=True, fill="both")
+            
+            self.win_gaze = ctk.CTkToplevel(self)
+            self.win_gaze.title("Gaze Prediction (Real-time)")
+            self.win_gaze.geometry("600x550")
+            
+            # Embed Matplotlib Figure
+            self.canvas = FigureCanvasTkAgg(self.fig, master=self.win_gaze)
+            self.canvas.draw()
+            self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            
+            # Add Toolbar
+            self.toolbar = NavigationToolbar2Tk(self.canvas, self.win_gaze)
+            self.toolbar.update()
+            self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            
+            self.lbl_gaze_val = ctk.CTkLabel(self.win_gaze, text="Gaze: [0.00, 0.00, 0.00]", font=("Courier", 16))
+            self.lbl_gaze_val.pack(pady=5)
+        else:
+            # Create progress window
+            self.win_progress = ctk.CTkToplevel(self)
+            self.win_progress.title("Processing Video...")
+            self.win_progress.geometry("500x200")
+            
+            self.lbl_progress_title = ctk.CTkLabel(
+                self.win_progress, 
+                text="Processing Video", 
+                font=("Arial", 20, "bold")
+            )
+            self.lbl_progress_title.pack(pady=20)
+            
+            self.progress_bar = ctk.CTkProgressBar(self.win_progress, width=400)
+            self.progress_bar.pack(pady=10)
+            self.progress_bar.set(0)
+            
+            self.lbl_progress_status = ctk.CTkLabel(
+                self.win_progress, 
+                text="Initializing...", 
+                font=("Arial", 14)
+            )
+            self.lbl_progress_status.pack(pady=10)
+            
+            self.lbl_progress_detail = ctk.CTkLabel(
+                self.win_progress, 
+                text="", 
+                font=("Courier", 12)
+            )
+            self.lbl_progress_detail.pack(pady=5)
         
         # Start thread
         self.frame_idx = 0
@@ -472,6 +531,16 @@ class GazeVisualizerApp(ctk.CTk):
 
     def stop_processing(self):
         self.is_processing = False
+    
+    def update_progress(self, progress_value, status_text):
+        """Update progress bar and status (for non-animation mode)."""
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.set(progress_value)
+        if hasattr(self, 'lbl_progress_status'):
+            self.lbl_progress_status.configure(text=status_text)
+        if hasattr(self, 'lbl_progress_detail'):
+            percent = int(progress_value * 100)
+            self.lbl_progress_detail.configure(text=f"Progress: {percent}%")
 
     def process_video_loop(self):
         try:
@@ -482,6 +551,8 @@ class GazeVisualizerApp(ctk.CTk):
             self.fps = cap.get(cv2.CAP_PROP_FPS)
             if self.fps <= 0: self.fps = 30.0
             
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
             # Initialize normalizer with extended blink window (0.3 seconds = ±300ms around blink)
             # This covers both full blinks and partial blinks (微闭) that affect gaze accuracy
             self.normalizer = MediaPipeEyeNormalizer(eye='left', blink_window_extend_sec=0.3)
@@ -491,6 +562,9 @@ class GazeVisualizerApp(ctk.CTk):
             
             # ===== PHASE 1: Quick scan to detect all blink timestamps =====
             print("[Phase 1] Scanning video for blink events...")
+            if not self.enable_animation:
+                self.after(0, lambda: self.lbl_progress_status.configure(text="Phase 1: Detecting blinks..."))
+            
             blink_timestamps = []
             frame_count = 0
             while True:
@@ -499,6 +573,12 @@ class GazeVisualizerApp(ctk.CTk):
                     break
                 timestamp = frame_count / self.fps
                 frame_count += 1
+                
+                # Update progress
+                if not self.enable_animation and frame_count % 30 == 0:
+                    progress = frame_count / total_frames * 0.3  # Phase 1 = 30% of total
+                    self.after(0, lambda p=progress, fc=frame_count, tf=total_frames: 
+                              self.update_progress(p, f"Phase 1: Scanning blinks... {fc}/{tf} frames"))
                 
                 # Quick blink detection (no ROI extraction)
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -511,12 +591,18 @@ class GazeVisualizerApp(ctk.CTk):
                             blink_timestamps.append(timestamp)
             
             print(f"[Phase 1] Found {len(blink_timestamps)} blink events")
+            if not self.enable_animation:
+                self.after(0, lambda: self.lbl_progress_status.configure(
+                    text=f"Phase 1 Complete: Found {len(blink_timestamps)} blinks"))
             
             # Pre-populate the normalizer's blink timestamps for symmetric window
             self.normalizer.blink_timestamps = blink_timestamps
             
             # ===== PHASE 2: Full processing with blink windows =====
             print("[Phase 2] Processing video with blink windows...")
+            if not self.enable_animation:
+                self.after(0, lambda: self.lbl_progress_status.configure(text="Phase 2: Processing gaze..."))
+            
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
             frame_count = 0
             
@@ -572,10 +658,17 @@ class GazeVisualizerApp(ctk.CTk):
                     self.eye_history.append(roi_display)
                     self.frame_index_history.append(frame_count - 1) # 0-based index
                     
-                    # Update GUI with correct timestamp
-                    # Update visualization less frequently to speed up processing (e.g., every 3rd frame)
-                    if frame_count % 3 == 0:
-                        self.after(0, self.update_visualization, roi_display, gaze_pred, timestamp, False)
+                    # Update GUI based on mode
+                    if self.enable_animation:
+                        # Update visualization less frequently to speed up processing (e.g., every 3rd frame)
+                        if frame_count % 3 == 0:
+                            self.after(0, self.update_visualization, roi_display, gaze_pred, timestamp, False)
+                    else:
+                        # Update progress bar
+                        if frame_count % 30 == 0:
+                            progress = 0.3 + (frame_count / total_frames) * 0.7  # Phase 2 = 70% of total
+                            self.after(0, lambda p=progress, fc=frame_count, tf=total_frames: 
+                                      self.update_progress(p, f"Phase 2: Processing... {fc}/{tf} frames"))
                 
                 # Control FPS roughly
                 # time.sleep(1.0 / self.fps) # Disabled to process as fast as possible
@@ -588,9 +681,16 @@ class GazeVisualizerApp(ctk.CTk):
             # Post-processing
             if self.gaze_history:
                 print("Applying post-processing filters...")
+                if not self.enable_animation:
+                    self.after(0, lambda: self.update_progress(0.95, "Applying filters..."))
+                
                 processor = SignalProcessor(fps=self.fps)
                 raw_data = np.array(self.gaze_history)
                 smoothed_data = processor.process(raw_data)
+                
+                if not self.enable_animation:
+                    self.after(0, lambda: self.update_progress(1.0, "Complete! Opening results..."))
+                    time.sleep(0.5)  # Brief pause to show completion
                 
                 # Update visualization with smoothed data
                 self.after(0, self.show_smoothed_result, smoothed_data)
@@ -667,7 +767,11 @@ class GazeVisualizerApp(ctk.CTk):
         self.btn_stop.configure(state="disabled")
         self.label_status.configure(text="Review Mode: Drag on plot to see video frame.")
         
-        # Keep eye window open for review
+        # Close progress window if exists
+        if hasattr(self, 'win_progress') and self.win_progress.winfo_exists():
+            self.win_progress.destroy()
+        
+        # Create or update eye window
         if not hasattr(self, 'win_eye') or not self.win_eye.winfo_exists():
             self.win_eye = ctk.CTkToplevel(self)
             self.win_eye.title("Review: Extracted Eye")
@@ -689,6 +793,28 @@ class GazeVisualizerApp(ctk.CTk):
         if hasattr(self, 'review_cap') and self.review_cap.isOpened():
             self.review_cap.release()
         self.review_cap = cv2.VideoCapture(self.video_path)
+        
+        # Create gaze plot window if not in animation mode
+        if not self.enable_animation:
+            self.win_gaze = ctk.CTkToplevel(self)
+            self.win_gaze.title("Gaze Prediction Results")
+            self.win_gaze.geometry("600x600")
+            
+            self.fig = plt.figure(figsize=(5, 4), dpi=100)
+            self.ax = self.fig.add_subplot(111)
+            
+            # Embed Matplotlib Figure
+            self.canvas = FigureCanvasTkAgg(self.fig, master=self.win_gaze)
+            self.canvas.draw()
+            self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            
+            # Add Toolbar
+            self.toolbar = NavigationToolbar2Tk(self.canvas, self.win_gaze)
+            self.toolbar.update()
+            self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+            
+            self.lbl_gaze_val = ctk.CTkLabel(self.win_gaze, text="Gaze: [0.00, 0.00, 0.00]", font=("Courier", 16))
+            self.lbl_gaze_val.pack(pady=5)
             
         # Update plot with smoothed data comparison
         if hasattr(self, 'fig'):
@@ -748,8 +874,9 @@ class GazeVisualizerApp(ctk.CTk):
             self.canvas.mpl_connect('button_press_event', self.on_plot_interaction)
             self.canvas.mpl_connect('motion_notify_event', self.on_plot_interaction)
             
-            # Create 3D Gaze Vector Visualization Window
-            self.create_gaze_vector_window(smoothed_data)
+            # Create 3D Gaze Vector Visualization Window (if enabled)
+            if self.show_3d_var.get():
+                self.create_gaze_vector_window(smoothed_data)
             
             # Add Save button to export plist data
             self.btn_save_plist = ctk.CTkButton(
@@ -1058,8 +1185,8 @@ class GazeVisualizerApp(ctk.CTk):
                     self.lbl_eye_img.configure(image=ctk_img)
                     self.lbl_eye_img.image = ctk_img
         
-        # Update 3D Gaze Vector View
-        if hasattr(self, 'ax_3d'):
+        # Update 3D Gaze Vector View (if window exists)
+        if hasattr(self, 'ax_3d') and hasattr(self, 'win_gaze_vector') and self.win_gaze_vector.winfo_exists():
             self.update_gaze_vector_display(idx)
         
         # Update Video View (Slower, maybe skip if dragging too fast?)

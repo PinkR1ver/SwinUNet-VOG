@@ -198,34 +198,52 @@ python gui_visualizer.py
 
 # 1. 选择视频文件（MKV/MP4/AVI）
 # 2. 加载模型检查点（自动加载 checkpoint_best.pth）
-# 3. 点击 "Start Processing"
-# 4. 观察实时结果
-# 5. 处理完成后，拖动图表查看任意帧
-# 6. 自动弹出 3D 注视向量可视化窗口
+# 3. 选择处理选项：
+#    - 🎬 Enable Real-time Animation: 实时显示处理过程（较慢）
+#    - 🎯 Show 3D Gaze Vector Window: 显示 3D 注视向量可视化
+# 4. 点击 "Start Processing"
+# 5. 等待处理完成（快速模式显示进度条）
+# 6. 拖动图表查看任意帧
+# 7. 点击 "💾 Save as Plist" 保存数据
 ```
+
+#### 处理模式
+
+**快速模式（推荐）**：
+- 不勾选 "Real-time Animation"
+- 只显示进度窗口
+- 处理速度快 2-3 倍
+- 完成后一次性弹出所有窗口
+
+**动画模式**：
+- 勾选 "Real-time Animation"
+- 实时显示眼部 ROI 和角度曲线
+- 可以观察处理过程
+- 处理速度较慢
 
 #### 可视化窗口说明
 
-处理完成后会自动打开 4 个窗口：
+处理完成后会打开以下窗口：
 
-1. **Gaze Angles Plot**（主窗口）：
+1. **Gaze Angles Plot**（必选）：
    - Pitch/Yaw 角度时间序列图
    - 可拖动时间轴游标
    - 实线：正常数据，虚线：眨眼插值
+   - 💾 Save as Plist 按钮
 
-2. **Eye Input**：
+2. **Eye Input**（必选）：
    - 当前帧的眼部 ROI（36×60）
    - 跟随时间轴实时更新
 
-3. **Video Frame**：
+3. **Video Frame**（必选）：
    - 完整视频帧
    - 跟随时间轴实时更新
 
-4. **3D Gaze Vector**（新增）：
-   - 3D 注视向量箭头可视化
-   - 显示 X/Y/Z 分量和投影
+4. **3D Gaze Vector**（可选）：
+   - 勾选 "Show 3D Gaze Vector Window" 才显示
+   - 3D 空间中的人眼-摄像头关系
+   - 青色箭头：注视向量
    - 跟随时间轴实时更新
-   - 显示当前向量值和角度
 
 #### 图表说明
 
