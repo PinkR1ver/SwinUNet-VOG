@@ -19,6 +19,8 @@ import scipy.signal
 from collections import deque
 import plistlib
 from datetime import datetime, timedelta
+import tempfile
+import pickle
 
 # Add current directory to path to ensure imports work
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +30,7 @@ from preprocessing import EyeImagePreprocessor
 
 class SignalProcessor:
     """Applies filtering to smooth gaze data."""
-    def __init__(self, fps=30.0, low_pass_cutoff=5.0):
+    def __init__(self, fps=30.0, low_pass_cutoff=8.0):
         self.fps = fps
         self.nyquist = fps / 2.0
         self.low_pass_cutoff = low_pass_cutoff
@@ -277,6 +279,63 @@ class MediaPipeEyeNormalizer:
         self.face_mesh.close()
 
 class GazeVisualizerApp(ctk.CTk):
+    def flush_buffers_to_disk(self):
+        """Write buffered data to disk to free memory."""
+        if not self.gaze_buffer:
+            return
+            
+        # Append to existing files
+        if os.path.exists(self.gaze_history_file):
+            existing_gaze = np.load(self.gaze_history_file)
+            new_gaze = np.vstack([existing_gaze, np.array(self.gaze_buffer)])
+        else:
+            new_gaze = np.array(self.gaze_buffer)
+        np.save(self.gaze_history_file, new_gaze)
+        
+        if os.path.exists(self.time_history_file):
+            existing_time = np.load(self.time_history_file)
+            new_time = np.concatenate([existing_time, np.array(self.time_buffer)])
+        else:
+            new_time = np.array(self.time_buffer)
+        np.save(self.time_history_file, new_time)
+        
+        # Eye images (pickle for variable size images)
+        if os.path.exists(self.eye_history_file):
+            with open(self.eye_history_file, 'rb') as f:
+                existing_eye = pickle.load(f)
+            existing_eye.extend(self.eye_buffer)
+            with open(self.eye_history_file, 'wb') as f:
+                pickle.dump(existing_eye, f)
+        else:
+            with open(self.eye_history_file, 'wb') as f:
+                pickle.dump(self.eye_buffer, f)
+        
+        # Clear buffers
+        self.gaze_buffer.clear()
+        self.time_buffer.clear()
+        self.eye_buffer.clear()
+    
+    def load_history_from_disk(self):
+        """Load all history data from disk."""
+        gaze_history = np.load(self.gaze_history_file) if os.path.exists(self.gaze_history_file) else np.array([])
+        time_history = np.load(self.time_history_file) if os.path.exists(self.time_history_file) else np.array([])
+        
+        eye_history = []
+        if os.path.exists(self.eye_history_file):
+            with open(self.eye_history_file, 'rb') as f:
+                eye_history = pickle.load(f)
+        
+        return gaze_history, time_history, eye_history
+    
+    def cleanup_temp_files(self):
+        """Clean up temporary files."""
+        import shutil
+        if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+            try:
+                shutil.rmtree(self.temp_dir)
+            except:
+                pass
+    
     def __init__(self):
         super().__init__()
         
@@ -297,10 +356,18 @@ class GazeVisualizerApp(ctk.CTk):
         self.frame_cache = []  # List of (frame_bgr, eye_img_rgb)
         self.draggable_marker = None
         
+        # Register cleanup on exit
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         self.setup_ui()
         
         # Try to load default checkpoint
         self.load_default_checkpoint()
+    
+    def on_closing(self):
+        """Handle window close event."""
+        self.cleanup_temp_files()
+        self.destroy()
 
     def setup_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -443,12 +510,20 @@ class GazeVisualizerApp(ctk.CTk):
         self.btn_select.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         
-        # Initialize history
-        self.gaze_history = []
+        # Initialize history - use temporary file to reduce memory usage
+        self.temp_dir = tempfile.mkdtemp(prefix="swinunet_vog_")
+        self.gaze_history_file = os.path.join(self.temp_dir, "gaze_history.npy")
+        self.time_history_file = os.path.join(self.temp_dir, "time_history.npy")
+        self.eye_history_file = os.path.join(self.temp_dir, "eye_history.pkl")
+        
+        # In-memory buffers (write to disk periodically)
+        self.gaze_buffer = []
+        self.time_buffer = []
+        self.eye_buffer = []
+        self.buffer_size = 1000  # Write to disk every N frames
+        
         self.start_time = time.time()
-        self.time_history = []
-        self.eye_history = [] # Cache processed eye images for review
-        self.frame_index_history = [] # Map time to frame index
+        self.frame_index_history = [] # Map time to frame index (keep in memory, small)
         
         # Check if animation mode is enabled
         self.enable_animation = self.animation_var.get()
@@ -626,17 +701,21 @@ class GazeVisualizerApp(ctk.CTk):
                     # If blinking, we skip inference to avoid artifacts
                     # We append NaN to history to indicate missing data
                     # For visualization, we can just skip this frame update or show last valid
-                    self.gaze_history.append(np.array([np.nan, np.nan, np.nan]))
-                    self.time_history.append(timestamp)
+                    self.gaze_buffer.append(np.array([np.nan, np.nan, np.nan]))
+                    self.time_buffer.append(timestamp)
                     
                     # Store None or placeholder for blink eye image (or the closed eye itself)
                     # Better to store the closed eye for review!
                     if roi_display is not None:
-                        self.eye_history.append(roi_display)
+                        self.eye_buffer.append(roi_display)
                     else:
                         # Fallback if detection failed completely
-                        self.eye_history.append(np.zeros((36, 60, 3), dtype=np.uint8))
+                        self.eye_buffer.append(np.zeros((36, 60, 3), dtype=np.uint8))
                     self.frame_index_history.append(frame_count - 1)
+                    
+                    # Flush to disk periodically
+                    if len(self.gaze_buffer) >= self.buffer_size:
+                        self.flush_buffers_to_disk()
                     
                     # Optional: Update visualization with "Blinking" status but no new point
                     # For speed, we might just skip visual update during blink
@@ -652,11 +731,15 @@ class GazeVisualizerApp(ctk.CTk):
                     # Normalize gaze vector for display
                     gaze_pred = gaze_pred / (np.linalg.norm(gaze_pred) + 1e-8)
                     
-                    # Record history
-                    self.gaze_history.append(gaze_pred)
-                    self.time_history.append(timestamp)
-                    self.eye_history.append(roi_display)
+                    # Record history (use buffer to reduce memory)
+                    self.gaze_buffer.append(gaze_pred)
+                    self.time_buffer.append(timestamp)
+                    self.eye_buffer.append(roi_display)
                     self.frame_index_history.append(frame_count - 1) # 0-based index
+                    
+                    # Flush to disk periodically
+                    if len(self.gaze_buffer) >= self.buffer_size:
+                        self.flush_buffers_to_disk()
                     
                     # Update GUI based on mode
                     if self.enable_animation:
@@ -679,14 +762,25 @@ class GazeVisualizerApp(ctk.CTk):
                 self.normalizer.close()
             
             # Post-processing
-            if self.gaze_history:
+            # Flush remaining buffer to disk
+            self.flush_buffers_to_disk()
+            
+            # Load all data from disk
+            gaze_history, time_history, eye_history = self.load_history_from_disk()
+            
+            if len(gaze_history) > 0:
                 print("Applying post-processing filters...")
                 if not self.enable_animation:
                     self.after(0, lambda: self.update_progress(0.95, "Applying filters..."))
                 
                 processor = SignalProcessor(fps=self.fps)
-                raw_data = np.array(self.gaze_history)
+                raw_data = gaze_history
                 smoothed_data = processor.process(raw_data)
+                
+                # Store for later use
+                self.gaze_history = gaze_history
+                self.time_history = time_history
+                self.eye_history = eye_history
                 
                 if not self.enable_animation:
                     self.after(0, lambda: self.update_progress(1.0, "Complete! Opening results..."))
@@ -721,11 +815,23 @@ class GazeVisualizerApp(ctk.CTk):
         # Note: History is already updated in the thread to ensure sync
         
         # Convert to numpy for plotting (handle recent history)
+        # Load from disk + buffer for real-time display
         recent_len = 300 # Show last N frames in real-time
-        start_idx = max(0, len(self.time_history) - recent_len)
         
-        times = np.array(self.time_history[start_idx:])
-        history_vectors = np.array(self.gaze_history[start_idx:])
+        # Combine disk data and buffer
+        if os.path.exists(self.time_history_file):
+            disk_times = np.load(self.time_history_file)
+            disk_gaze = np.load(self.gaze_history_file)
+        else:
+            disk_times = np.array([])
+            disk_gaze = np.array([]).reshape(0, 3)
+        
+        all_times = np.concatenate([disk_times, np.array(self.time_buffer)])
+        all_gaze = np.vstack([disk_gaze, np.array(self.gaze_buffer)]) if len(self.gaze_buffer) > 0 else disk_gaze
+        
+        start_idx = max(0, len(all_times) - recent_len)
+        times = all_times[start_idx:]
+        history_vectors = all_gaze[start_idx:]
         
         if len(times) > 0:
             # Convert to angles
@@ -1060,23 +1166,32 @@ class GazeVisualizerApp(ctk.CTk):
     def save_to_plist(self, smoothed_data):
         """Save gaze data to plist format for further analysis."""
         try:
-            # Ask user for save location
+            # Ask user for save location (base filename)
             from tkinter import filedialog
-            default_filename = f"gaze_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.plist"
+            default_filename = f"gaze_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             save_path = filedialog.asksaveasfilename(
                 defaultextension=".plist",
                 filetypes=[("Plist files", "*.plist"), ("All files", "*.*")],
-                initialfile=default_filename
+                initialfile=default_filename + "_filtered.plist"
             )
             
             if not save_path:
                 return
             
+            # Generate both filenames
+            base_path = save_path.rsplit('.', 1)[0]
+            if base_path.endswith('_filtered'):
+                base_path = base_path[:-9]  # Remove '_filtered'
+            
+            filtered_path = base_path + "_filtered.plist"
+            raw_path = base_path + "_raw.plist"
+            
             # Prepare data in plist format (matching your analysis code structure)
             times = np.array(self.time_history)
             raw_vectors = np.array(self.gaze_history)
             
-            # Convert to angles
+            # Convert to angles (both raw and smoothed)
+            raw_angles = self.vector_to_pitch_yaw(raw_vectors)
             smoothed_angles = self.vector_to_pitch_yaw(smoothed_data)
             
             # Generate timestamp strings (similar to your HIT format)
@@ -1086,60 +1201,71 @@ class GazeVisualizerApp(ctk.CTk):
                 timestamp = base_time + timedelta(seconds=float(t))
                 time_list.append(timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])
             
-            # Create plist data structure (compatible with your Streamlit analysis code)
-            plist_data = {
-                # Time data
-                'TimeList': time_list,
-                
-                # Eye movement data in degrees (matching your analysis code's expected format)
-                # Horizontal axis: Yaw (left-right eye movement)
-                'LeftEyeXDegList': smoothed_angles[:, 1].tolist(),  # Yaw angles
-                'RightEyeXDegList': smoothed_angles[:, 1].tolist(), # Same data for both eyes
-                
-                # Vertical axis: Pitch (up-down eye movement)
-                'LeftEyeYDegList': smoothed_angles[:, 0].tolist(),  # Pitch angles
-                'RightEyeYDegList': smoothed_angles[:, 0].tolist(), # Same data for both eyes
-                
-                # Also keep the original naming for reference
-                'GazePitchDegList': smoothed_angles[:, 0].tolist(),
-                'GazeYawDegList': smoothed_angles[:, 1].tolist(),
-                
-                # Raw gaze vectors (x, y, z) for advanced analysis
-                'GazeXList': smoothed_data[:, 0].tolist(),
-                'GazeYList': smoothed_data[:, 1].tolist(),
-                'GazeZList': smoothed_data[:, 2].tolist(),
-                
-                # Metadata
+            # Common metadata
+            metadata = {
                 'VideoFile': os.path.basename(self.video_path) if self.video_path else 'unknown',
                 'FPS': float(self.fps) if hasattr(self, 'fps') else 30.0,
                 'TotalFrames': len(times),
                 'Duration': float(times[-1]) if len(times) > 0 else 0.0,
                 'ProcessingDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                
-                # Processing parameters
                 'BlinkWindowSec': 0.3,
-                'FilteredData': True,
                 'CoordinateSystem': 'MPIIGaze',
-                
-                # Additional info
-                'Description': 'Gaze estimation data from SwinUNet-VOG - Compatible with pVestibular analysis',
                 'DataFormat': 'Eye angles in degrees, compatible with LeftEyeXDegList/LeftEyeYDegList format',
                 'PitchRange': '[-25, 45] degrees (vertical)',
                 'YawRange': '[-45, 45] degrees (horizontal)',
             }
             
-            # Save to plist file
-            with open(save_path, 'wb') as f:
-                plistlib.dump(plist_data, f)
+            # Create FILTERED plist data structure
+            plist_filtered = {
+                'TimeList': time_list,
+                'LeftEyeXDegList': smoothed_angles[:, 1].tolist(),  # Yaw
+                'RightEyeXDegList': smoothed_angles[:, 1].tolist(),
+                'LeftEyeYDegList': smoothed_angles[:, 0].tolist(),  # Pitch
+                'RightEyeYDegList': smoothed_angles[:, 0].tolist(),
+                'GazePitchDegList': smoothed_angles[:, 0].tolist(),
+                'GazeYawDegList': smoothed_angles[:, 1].tolist(),
+                'GazeXList': smoothed_data[:, 0].tolist(),
+                'GazeYList': smoothed_data[:, 1].tolist(),
+                'GazeZList': smoothed_data[:, 2].tolist(),
+                'FilteredData': True,
+                'Description': 'Filtered gaze data from SwinUNet-VOG (median + low-pass filtered)',
+                **metadata
+            }
+            
+            # Create RAW plist data structure
+            plist_raw = {
+                'TimeList': time_list,
+                'LeftEyeXDegList': raw_angles[:, 1].tolist(),  # Yaw
+                'RightEyeXDegList': raw_angles[:, 1].tolist(),
+                'LeftEyeYDegList': raw_angles[:, 0].tolist(),  # Pitch
+                'RightEyeYDegList': raw_angles[:, 0].tolist(),
+                'GazePitchDegList': raw_angles[:, 0].tolist(),
+                'GazeYawDegList': raw_angles[:, 1].tolist(),
+                'GazeXList': raw_vectors[:, 0].tolist(),
+                'GazeYList': raw_vectors[:, 1].tolist(),
+                'GazeZList': raw_vectors[:, 2].tolist(),
+                'FilteredData': False,
+                'Description': 'Raw gaze data from SwinUNet-VOG (no filtering, contains blink interpolation)',
+                **metadata
+            }
+            
+            # Save both files
+            with open(filtered_path, 'wb') as f:
+                plistlib.dump(plist_filtered, f)
+            
+            with open(raw_path, 'wb') as f:
+                plistlib.dump(plist_raw, f)
             
             # Show success message
             if hasattr(self, 'label_status'):
                 self.label_status.configure(
-                    text=f"✅ Data saved to: {os.path.basename(save_path)}"
+                    text=f"✅ Saved: {os.path.basename(raw_path)} & {os.path.basename(filtered_path)}"
                 )
             
-            print(f"[Save] Plist data saved successfully to: {save_path}")
-            print(f"[Save] Total frames: {len(times)}, Duration: {times[-1]:.2f}s")
+            print(f"✅ Plist data saved successfully:")
+            print(f"   Raw: {os.path.basename(raw_path)}")
+            print(f"   Filtered: {os.path.basename(filtered_path)}")
+            print(f"   Total frames: {len(times)}, Duration: {times[-1]:.2f}s")
             
         except Exception as e:
             error_msg = f"Error saving plist: {str(e)}"
