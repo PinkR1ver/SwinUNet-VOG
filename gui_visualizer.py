@@ -28,6 +28,306 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model import SwinUNet
 from preprocessing import EyeImagePreprocessor
 
+class NystagmusAnalyzer:
+    """Nystagmus (眼震) detection and analysis algorithm."""
+    
+    def __init__(self, fps=30.0):
+        self.fps = fps
+        
+    def butter_highpass_filter(self, data, cutoff, fs, order=5):
+        """Zero-phase highpass Butterworth filter."""
+        nyquist = 0.5 * fs
+        normal_cutoff = cutoff / nyquist
+        if normal_cutoff >= 1:
+            return data
+        b, a = scipy.signal.butter(order, normal_cutoff, btype='high', analog=False)
+        filtered_data = scipy.signal.filtfilt(b, a, data, 
+                                              padlen=min(len(data)-1, 3*(max(len(b), len(a))-1)))
+        return filtered_data
+    
+    def butter_lowpass_filter(self, data, cutoff, fs, order=5):
+        """Zero-phase lowpass Butterworth filter."""
+        nyquist = 0.5 * fs
+        normal_cutoff = cutoff / nyquist
+        if normal_cutoff >= 1:
+            return data
+        b, a = scipy.signal.butter(order, normal_cutoff, btype='low', analog=False)
+        filtered_data = scipy.signal.filtfilt(b, a, data, 
+                                              padlen=min(len(data)-1, 3*(max(len(b), len(a))-1)))
+        return filtered_data
+    
+    def moving_average_filter(self, data, window_size):
+        """Moving average filter."""
+        window_size = int(window_size)
+        half_window = window_size // 2
+        padded_data = np.pad(data, (half_window, half_window), mode='edge')
+        ma = np.cumsum(padded_data, dtype=float)
+        ma[window_size:] = ma[window_size:] - ma[:-window_size]
+        filtered_data = ma[window_size - 1:] / window_size
+        return filtered_data[:len(data)]
+    
+    def signal_preprocess(self, timestamps, eye_angles, 
+                         highpass_cutoff=0.1, lowpass_cutoff=6.0, 
+                         interpolate_ratio=10):
+        """Preprocess signal with filtering and resampling."""
+        original_time = timestamps
+        original_signal = eye_angles
+        
+        min_len = min(len(original_time), len(original_signal))
+        original_time = original_time[:min_len]
+        original_signal = original_signal[:min_len]
+        
+        if len(original_signal) == 0 or len(original_time) == 0:
+            return np.array([]), np.array([])
+        
+        # 1. Highpass filter (remove low-frequency drift)
+        signal_filtered = self.butter_highpass_filter(
+            original_signal, cutoff=highpass_cutoff, fs=self.fps, order=5
+        )
+        
+        # 2. Lowpass filter (remove high-frequency noise)
+        signal_filtered = self.butter_lowpass_filter(
+            signal_filtered, cutoff=lowpass_cutoff, fs=self.fps, order=5
+        )
+        
+        # 3. Resample (increase time resolution)
+        signal_filtered = scipy.signal.resample(
+            signal_filtered, int(len(original_signal) * interpolate_ratio)
+        )
+        
+        # 4. Generate new time series
+        time = np.linspace(original_time[0], original_time[-1], len(signal_filtered))
+        
+        return signal_filtered, time
+    
+    def find_turning_points(self, signal_data, prominence=0.1, distance=150):
+        """Detect turning points (local maxima and minima)."""
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(signal_data, prominence=prominence, distance=distance)
+        valleys, _ = find_peaks(-signal_data, prominence=prominence, distance=distance)
+        turning_points = np.sort(np.concatenate([peaks, valleys]))
+        return turning_points
+    
+    def calculate_slopes(self, time, signal, turning_points):
+        """Calculate slopes between adjacent turning points."""
+        slopes = []
+        slope_times = []
+        for i in range(len(turning_points)-1):
+            t1, t2 = time[turning_points[i]], time[turning_points[i+1]]
+            y1, y2 = signal[turning_points[i]], signal[turning_points[i+1]]
+            slope = (y2 - y1) / (t2 - t1)
+            slope_time = (t1 + t2) / 2
+            slopes.append(slope)
+            slope_times.append(slope_time)
+        return np.array(slope_times), np.array(slopes)
+    
+    def identify_nystagmus_patterns(self, signal_data, time_data, 
+                                    min_time=0.3, max_time=0.8,
+                                    min_ratio=1.4, max_ratio=8.0, 
+                                    direction_axis="horizontal"):
+        """
+        Identify nystagmus patterns (fast and slow phases).
+        
+        Returns:
+            patterns: Valid nystagmus patterns
+            filtered_patterns: Patterns filtered out by CV
+            direction: Nystagmus direction (left/right/up/down)
+            spv: Slow Phase Velocity (deg/s)
+            cv: Coefficient of Variation (%)
+        """
+        # Detect turning points
+        turning_points = self.find_turning_points(signal_data, prominence=0.1, distance=150)
+        
+        if len(turning_points) < 3:
+            return [], [], "unknown", 0, float('inf')
+        
+        # Collect potential nystagmus patterns
+        potential_patterns = []
+        
+        for i in range(1, len(turning_points)-1):
+            idx1 = turning_points[i-1]
+            idx2 = turning_points[i]
+            idx3 = turning_points[i+1]
+            
+            p1 = np.array([time_data[idx1], signal_data[idx1]])
+            p2 = np.array([time_data[idx2], signal_data[idx2]])
+            p3 = np.array([time_data[idx3], signal_data[idx3]])
+            
+            # Check time threshold
+            total_time = p3[0] - p1[0]
+            if not (min_time <= total_time <= max_time):
+                continue
+            
+            # Calculate slopes
+            slope_before = (p2[1] - p1[1]) / (p2[0] - p1[0])
+            slope_after = (p3[1] - p2[1]) / (p3[0] - p2[0])
+            
+            # Determine fast/slow phase
+            if abs(slope_before) > abs(slope_after):
+                fast_slope = slope_before
+                slow_slope = slope_after
+                fast_phase_first = True
+            else:
+                fast_slope = slope_after
+                slow_slope = slope_before
+                fast_phase_first = False
+            
+            # Check direction consistency (fast and slow should be opposite)
+            if fast_slope * slow_slope > 0:
+                continue
+            
+            ratio = abs(fast_slope) / abs(slow_slope) if slow_slope != 0 else float('inf')
+            
+            if min_ratio <= ratio <= max_ratio:
+                potential_patterns.append({
+                    'index': i,
+                    'time_point': time_data[idx2],
+                    'slow_slope': slow_slope,
+                    'fast_slope': fast_slope,
+                    'ratio': ratio,
+                    'fast_phase_first': fast_phase_first,
+                    'total_time': total_time
+                })
+        
+        if not potential_patterns:
+            return [], [], "unknown", 0, float('inf')
+        
+        # CV-based outlier filtering using MAD (Median Absolute Deviation)
+        slow_slopes = np.array([p['slow_slope'] for p in potential_patterns])
+        original_indices = list(range(len(potential_patterns)))
+        
+        median_slope = np.median(slow_slopes)
+        mad = np.median(np.abs(slow_slopes - median_slope))
+        mad_normalized = 1.4826 * mad
+        cv = (mad_normalized / abs(median_slope)) * 100 if median_slope != 0 else float('inf')
+        
+        # Iteratively remove outliers until CV <= 20% or only 3 patterns remain
+        filtered_indices = []
+        while cv > 20 and len(slow_slopes) > 3:
+            modified_z_scores = 0.6745 * np.abs(slow_slopes - median_slope) / (mad + 1e-8)
+            max_z_idx = np.argmax(modified_z_scores)
+            filtered_indices.append(original_indices[max_z_idx])
+            slow_slopes = np.delete(slow_slopes, max_z_idx)
+            original_indices.pop(max_z_idx)
+            
+            median_slope = np.median(slow_slopes)
+            mad = np.median(np.abs(slow_slopes - median_slope))
+            mad_normalized = 1.4826 * mad
+            cv = (mad_normalized / abs(median_slope)) * 100 if median_slope != 0 else float('inf')
+        
+        # Separate valid and filtered patterns
+        patterns = []
+        filtered_patterns = []
+        for idx, pattern in enumerate(potential_patterns):
+            if idx in filtered_indices:
+                filtered_patterns.append(pattern)
+            else:
+                patterns.append(pattern)
+        
+        # Calculate final direction and SPV
+        final_median_slope = np.median(slow_slopes)
+        
+        if direction_axis == "horizontal":
+            direction = "left" if final_median_slope > 0 else "right"
+        else:
+            direction = "up" if final_median_slope > 0 else "down"
+        
+        spv = abs(final_median_slope)
+        
+        return patterns, filtered_patterns, direction, spv, cv
+    
+    def analyze(self, timestamps, angles, blink_mask, axis="horizontal"):
+        """
+        Full nystagmus analysis pipeline.
+        
+        Args:
+            timestamps: Time array
+            angles: Angle array (Pitch or Yaw)
+            blink_mask: Boolean mask where True = blink (to exclude)
+            axis: "horizontal" (yaw) or "vertical" (pitch)
+        
+        Returns:
+            dict with analysis results
+        """
+        # Exclude blink data
+        valid_mask = ~blink_mask
+        valid_times = timestamps[valid_mask]
+        valid_angles = angles[valid_mask]
+        
+        if len(valid_times) < 30:
+            return {
+                'success': False,
+                'error': 'Not enough valid data (too many blinks)',
+                'n_valid_samples': len(valid_times)
+            }
+        
+        # Store original data for visualization
+        original_times = valid_times.copy()
+        original_angles = valid_angles.copy()
+        
+        # Step 1: High-pass filter only
+        signal_highpass = self.butter_highpass_filter(
+            valid_angles, cutoff=0.1, fs=self.fps, order=5
+        )
+        
+        # Step 2: Low-pass filter (on highpass output)
+        signal_lowpass = self.butter_lowpass_filter(
+            signal_highpass, cutoff=6.0, fs=self.fps, order=5
+        )
+        
+        # Step 3: Full preprocessing (includes resampling)
+        filtered_signal, time = self.signal_preprocess(
+            valid_times, valid_angles,
+            highpass_cutoff=0.1, lowpass_cutoff=6.0, interpolate_ratio=10
+        )
+        
+        if len(filtered_signal) == 0:
+            return {
+                'success': False,
+                'error': 'Signal preprocessing failed'
+            }
+        
+        # Detect turning points
+        turning_points = self.find_turning_points(filtered_signal, prominence=0.1, distance=150)
+        
+        # Calculate slopes
+        slope_times, slopes = self.calculate_slopes(time, filtered_signal, turning_points)
+        
+        # Identify nystagmus patterns
+        patterns, filtered_patterns, direction, spv, cv = self.identify_nystagmus_patterns(
+            filtered_signal, time,
+            min_time=0.3, max_time=0.8,
+            min_ratio=1.4, max_ratio=8.0,
+            direction_axis=axis
+        )
+        
+        return {
+            'success': True,
+            'axis': axis,
+            'n_valid_samples': len(valid_times),
+            'n_blink_samples': np.sum(blink_mask),
+            # Original data for plotting
+            'original_times': original_times,
+            'original_angles': original_angles,
+            # Intermediate processing steps
+            'signal_highpass': signal_highpass,
+            'signal_lowpass': signal_lowpass,
+            # Final processed data
+            'filtered_signal': filtered_signal,
+            'time': time,
+            'turning_points': turning_points,
+            'slope_times': slope_times,
+            'slopes': slopes,
+            'patterns': patterns,
+            'filtered_patterns': filtered_patterns,
+            'n_patterns': len(patterns),
+            'n_filtered_patterns': len(filtered_patterns),
+            'direction': direction,
+            'spv': spv,
+            'cv': cv
+        }
+
+
 class SignalProcessor:
     """Applies filtering to smooth gaze data."""
     def __init__(self, fps=30.0, low_pass_cutoff=8.0):
@@ -366,7 +666,32 @@ class GazeVisualizerApp(ctk.CTk):
     
     def on_closing(self):
         """Handle window close event."""
+        # Stop processing if running
+        self.is_processing = False
+        
+        # Close normalizer
+        if hasattr(self, 'normalizer') and self.normalizer is not None:
+            try:
+                self.normalizer.close()
+            except:
+                pass
+        
+        # Close video capture
+        if hasattr(self, 'review_cap') and self.review_cap is not None:
+            try:
+                self.review_cap.release()
+            except:
+                pass
+        
+        # Close all matplotlib figures
+        try:
+            plt.close('all')
+        except:
+            pass
+        
+        # Clean up temp files
         self.cleanup_temp_files()
+        
         self.destroy()
 
     def setup_ui(self):
@@ -501,9 +826,65 @@ class GazeVisualizerApp(ctk.CTk):
             yaw = np.arctan2(-x, -z)
             return np.degrees(np.stack([pitch, yaw], axis=1))
 
+    def cleanup_previous_session(self):
+        """Clean up resources from previous processing session."""
+        # Close previous normalizer
+        if hasattr(self, 'normalizer') and self.normalizer is not None:
+            try:
+                self.normalizer.close()
+            except:
+                pass
+            self.normalizer = None
+        
+        # Close previous review video capture
+        if hasattr(self, 'review_cap') and self.review_cap is not None:
+            try:
+                self.review_cap.release()
+            except:
+                pass
+            self.review_cap = None
+        
+        # Close matplotlib figures
+        if hasattr(self, 'fig'):
+            try:
+                plt.close(self.fig)
+            except:
+                pass
+        if hasattr(self, 'fig_3d'):
+            try:
+                plt.close(self.fig_3d)
+            except:
+                pass
+        
+        # Close previous windows
+        windows_to_close = ['win_eye', 'win_gaze', 'win_video', 'win_gaze_vector', 'win_progress']
+        for win_name in windows_to_close:
+            if hasattr(self, win_name):
+                win = getattr(self, win_name)
+                if win is not None:
+                    try:
+                        if win.winfo_exists():
+                            win.destroy()
+                    except:
+                        pass
+                setattr(self, win_name, None)
+        
+        # Clean up temp files from previous session
+        self.cleanup_temp_files()
+        
+        # Clear history data
+        self.gaze_history = []
+        self.time_history = []
+        self.eye_history = []
+        self.frame_cache = []
+        self.frame_index_history = []
+
     def start_processing(self):
         if not self.video_path or not self.model:
             return
+        
+        # Clean up previous session first
+        self.cleanup_previous_session()
             
         self.is_processing = True
         self.btn_start.configure(state="disabled")
@@ -984,15 +1365,447 @@ class GazeVisualizerApp(ctk.CTk):
             if self.show_3d_var.get():
                 self.create_gaze_vector_window(smoothed_data)
             
+            # Button frame for actions
+            self.frame_buttons = ctk.CTkFrame(self.win_gaze)
+            self.frame_buttons.pack(pady=10, fill="x", padx=20)
+            
             # Add Save button to export plist data
             self.btn_save_plist = ctk.CTkButton(
-                self.win_gaze, 
+                self.frame_buttons, 
                 text="💾 Save as Plist", 
                 command=lambda: self.save_to_plist(smoothed_data),
                 fg_color="green",
-                hover_color="darkgreen"
+                hover_color="darkgreen",
+                width=150
             )
-            self.btn_save_plist.pack(pady=5)
+            self.btn_save_plist.pack(side="left", padx=5)
+            
+            # Add Nystagmus Analysis button
+            self.btn_nystagmus = ctk.CTkButton(
+                self.frame_buttons, 
+                text="🔬 Nystagmus Analysis", 
+                command=lambda: self.analyze_nystagmus(smoothed_data),
+                fg_color="#8B4513",
+                hover_color="#654321",
+                width=180
+            )
+            self.btn_nystagmus.pack(side="left", padx=5)
+            
+            # Store blink mask for nystagmus analysis
+            self.blink_mask = np.isnan(raw_vectors).any(axis=1)
+            self.smoothed_angles_cache = smoothed_angles
+
+    def analyze_nystagmus(self, smoothed_data):
+        """Perform nystagmus analysis on the gaze data."""
+        try:
+            times = np.array(self.time_history)
+            
+            # Create analyzer
+            analyzer = NystagmusAnalyzer(fps=self.fps)
+            
+            # Analyze horizontal (Yaw) - more common for nystagmus
+            result_h = analyzer.analyze(
+                times, 
+                self.smoothed_angles_cache[:, 1],  # Yaw
+                self.blink_mask,
+                axis="horizontal"
+            )
+            
+            # Analyze vertical (Pitch)
+            result_v = analyzer.analyze(
+                times, 
+                self.smoothed_angles_cache[:, 0],  # Pitch
+                self.blink_mask,
+                axis="vertical"
+            )
+            
+            # Show results window
+            self.show_nystagmus_results(result_h, result_v)
+            
+        except Exception as e:
+            print(f"[Nystagmus Analysis Error] {e}")
+            import traceback
+            traceback.print_exc()
+            if hasattr(self, 'label_status'):
+                self.label_status.configure(text=f"❌ Nystagmus analysis error: {str(e)}")
+    
+    def show_nystagmus_results(self, result_h, result_v):
+        """Display nystagmus analysis results in a new window."""
+        # Create results window (larger to fit 4 subplots)
+        self.win_nystagmus = ctk.CTkToplevel(self)
+        self.win_nystagmus.title("🔬 Nystagmus Analysis Results")
+        self.win_nystagmus.geometry("1100x900")
+        
+        # Title
+        title_label = ctk.CTkLabel(
+            self.win_nystagmus, 
+            text="Nystagmus Analysis Results", 
+            font=("Arial", 20, "bold")
+        )
+        title_label.pack(pady=10)
+        
+        # Create tabview for H and V results (larger for 4 subplots)
+        tabview = ctk.CTkTabview(self.win_nystagmus, width=1050, height=800)
+        tabview.pack(pady=10, padx=20, fill="both", expand=True)
+        
+        tabview.add("Horizontal (Yaw)")
+        tabview.add("Vertical (Pitch)")
+        tabview.add("Summary")
+        
+        # Horizontal results
+        self._create_nystagmus_result_tab(tabview.tab("Horizontal (Yaw)"), result_h, "Horizontal")
+        
+        # Vertical results
+        self._create_nystagmus_result_tab(tabview.tab("Vertical (Pitch)"), result_v, "Vertical")
+        
+        # Summary tab
+        self._create_nystagmus_summary_tab(tabview.tab("Summary"), result_h, result_v)
+        
+        # Info label
+        info_label = ctk.CTkLabel(
+            self.win_nystagmus, 
+            text="Note: Blink segments are automatically excluded from analysis",
+            font=("Arial", 11),
+            text_color="gray"
+        )
+        info_label.pack(pady=5)
+    
+    def _create_nystagmus_result_tab(self, parent, result, axis_name):
+        """Create a tab showing nystagmus analysis results for one axis with 4 subplots."""
+        if not result['success']:
+            error_label = ctk.CTkLabel(
+                parent, 
+                text=f"❌ Analysis Failed: {result.get('error', 'Unknown error')}",
+                font=("Arial", 14),
+                text_color="red"
+            )
+            error_label.pack(pady=20)
+            return
+        
+        # Create scrollable frame for all content
+        frame = ctk.CTkScrollableFrame(parent, width=750, height=500)
+        frame.pack(pady=5, padx=5, fill="both", expand=True)
+        
+        # Key metrics row
+        metrics_frame = ctk.CTkFrame(frame)
+        metrics_frame.pack(pady=5, padx=5, fill="x")
+        
+        # SPV (Slow Phase Velocity)
+        spv_frame = ctk.CTkFrame(metrics_frame)
+        spv_frame.pack(side="left", padx=15, pady=5)
+        ctk.CTkLabel(spv_frame, text="SPV", font=("Arial", 11)).pack()
+        ctk.CTkLabel(
+            spv_frame, 
+            text=f"{result['spv']:.2f}°/s", 
+            font=("Arial", 20, "bold"),
+            text_color="cyan"
+        ).pack()
+        
+        # Direction
+        dir_frame = ctk.CTkFrame(metrics_frame)
+        dir_frame.pack(side="left", padx=15, pady=5)
+        ctk.CTkLabel(dir_frame, text="Direction", font=("Arial", 11)).pack()
+        dir_symbols = {"left": "← Left", "right": "Right →", "up": "↑ Up", "down": "Down ↓", "unknown": "?"}
+        dir_colors = {"left": "yellow", "right": "yellow", "up": "orange", "down": "orange", "unknown": "gray"}
+        ctk.CTkLabel(
+            dir_frame, 
+            text=dir_symbols.get(result['direction'], "?"), 
+            font=("Arial", 20, "bold"),
+            text_color=dir_colors.get(result['direction'], "gray")
+        ).pack()
+        
+        # CV
+        cv_frame = ctk.CTkFrame(metrics_frame)
+        cv_frame.pack(side="left", padx=15, pady=5)
+        ctk.CTkLabel(cv_frame, text="CV", font=("Arial", 11)).pack()
+        cv_color = "green" if result['cv'] <= 20 else "yellow" if result['cv'] <= 40 else "red"
+        ctk.CTkLabel(
+            cv_frame, 
+            text=f"{result['cv']:.1f}%", 
+            font=("Arial", 20, "bold"),
+            text_color=cv_color
+        ).pack()
+        
+        # Pattern count
+        count_frame = ctk.CTkFrame(metrics_frame)
+        count_frame.pack(side="left", padx=15, pady=5)
+        ctk.CTkLabel(count_frame, text="Patterns", font=("Arial", 11)).pack()
+        ctk.CTkLabel(
+            count_frame, 
+            text=f"{result['n_patterns']} ({result['n_filtered_patterns']} filtered)", 
+            font=("Arial", 16, "bold"),
+            text_color="white"
+        ).pack()
+        
+        # ========== 4-SUBPLOT FIGURE (similar to Streamlit) ==========
+        if len(result['filtered_signal']) > 0:
+            plot_frame = ctk.CTkFrame(frame)
+            plot_frame.pack(pady=5, padx=5, fill="both", expand=True)
+            
+            fig_nys = plt.Figure(figsize=(10, 12), dpi=100)
+            
+            # ---------- Subplot 1: Signal Preprocessing Steps ----------
+            ax1 = fig_nys.add_subplot(4, 1, 1)
+            
+            # Plot original data
+            if 'original_times' in result and 'original_angles' in result:
+                ax1.plot(result['original_times'], result['original_angles'], 
+                        label='Original Data', alpha=0.7, color='blue')
+                
+                # Plot high-pass filtered
+                if 'signal_highpass' in result:
+                    ax1.plot(result['original_times'], result['signal_highpass'], 
+                            label='After High-pass Filter', alpha=0.7, color='orange')
+                
+                # Plot low-pass filtered
+                if 'signal_lowpass' in result:
+                    ax1.plot(result['original_times'], result['signal_lowpass'], 
+                            label='After Low-pass Filter', alpha=0.9, linewidth=2, color='green')
+            
+            ax1.set_title(f'1. Signal Preprocessing Steps ({axis_name})', fontsize=10, fontweight='bold')
+            ax1.set_ylabel('Position (°)')
+            ax1.grid(True, alpha=0.3)
+            ax1.legend(loc='upper right', fontsize=8)
+            
+            # ---------- Subplot 2: Turning Point Detection ----------
+            ax2 = fig_nys.add_subplot(4, 1, 2)
+            
+            time = result['time']
+            signal = result['filtered_signal']
+            tp = result['turning_points']
+            
+            # Original signal (gray background)
+            ax2.plot(time, signal, 'gray', alpha=0.3, label='Filtered Signal')
+            
+            # Turning points connection
+            if len(tp) > 0:
+                ax2.plot(time[tp], signal[tp], 'r-', linewidth=2, label='Turning Points Connection')
+                ax2.plot(time[tp], signal[tp], 'ro', markersize=5, label='Turning Points')
+            
+            ax2.set_title(f'2. Eye Movement Signal with Turning Points ({axis_name})', fontsize=10, fontweight='bold')
+            ax2.set_ylabel('Position (°)')
+            ax2.legend(loc='upper right', fontsize=8)
+            ax2.grid(True, alpha=0.3)
+            
+            # ---------- Subplot 3: Slope Calculation ----------
+            ax3 = fig_nys.add_subplot(4, 1, 3)
+            
+            if len(result['slope_times']) > 0:
+                ax3.scatter(result['slope_times'], result['slopes'], c='blue', s=30, alpha=0.7)
+            ax3.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+            
+            ax3.set_title(f'3. Calculated Slopes ({axis_name})', fontsize=10, fontweight='bold')
+            ax3.set_ylabel('Slope (°/s)')
+            ax3.grid(True, alpha=0.3)
+            ax3.set_ylim([-60, 60])
+            
+            # ---------- Subplot 4: Nystagmus Pattern Recognition ----------
+            ax4 = fig_nys.add_subplot(4, 1, 4)
+            
+            # Background signal
+            ax4.plot(time, signal, 'gray', alpha=0.5, label='Signal')
+            
+            # Plot filtered patterns (light colors - outliers)
+            for pattern_item in result['filtered_patterns']:
+                idx = pattern_item['index']
+                if idx > 0 and idx + 1 < len(tp):
+                    idx1 = tp[idx-1]
+                    idx2 = tp[idx]
+                    idx3 = tp[idx+1]
+                    
+                    if pattern_item['fast_phase_first']:
+                        fast_segment = time[idx1:idx2+1]
+                        slow_segment = time[idx2:idx3+1]
+                        fast_signal = signal[idx1:idx2+1]
+                        slow_signal = signal[idx2:idx3+1]
+                    else:
+                        slow_segment = time[idx1:idx2+1]
+                        fast_segment = time[idx2:idx3+1]
+                        slow_signal = signal[idx1:idx2+1]
+                        fast_signal = signal[idx2:idx3+1]
+                    
+                    ax4.plot(fast_segment, fast_signal, 'lightcoral', linewidth=2, alpha=0.5)
+                    ax4.plot(slow_segment, slow_signal, 'lightblue', linewidth=2, alpha=0.5)
+            
+            # Plot final patterns (bright colors - valid)
+            first_fast = True
+            first_slow = True
+            for pattern_item in result['patterns']:
+                idx = pattern_item['index']
+                if idx > 0 and idx + 1 < len(tp):
+                    idx1 = tp[idx-1]
+                    idx2 = tp[idx]
+                    idx3 = tp[idx+1]
+                    
+                    if pattern_item['fast_phase_first']:
+                        fast_segment = time[idx1:idx2+1]
+                        slow_segment = time[idx2:idx3+1]
+                        fast_signal = signal[idx1:idx2+1]
+                        slow_signal = signal[idx2:idx3+1]
+                    else:
+                        slow_segment = time[idx1:idx2+1]
+                        fast_segment = time[idx2:idx3+1]
+                        slow_signal = signal[idx1:idx2+1]
+                        fast_signal = signal[idx2:idx3+1]
+                    
+                    # Add labels only for the first occurrence
+                    fast_label = 'Fast Phase (Red)' if first_fast else None
+                    slow_label = 'Slow Phase (Blue)' if first_slow else None
+                    
+                    ax4.plot(fast_segment, fast_signal, 'red', linewidth=2, alpha=0.8, label=fast_label)
+                    ax4.plot(slow_segment, slow_signal, 'blue', linewidth=2, alpha=0.8, label=slow_label)
+                    
+                    first_fast = False
+                    first_slow = False
+            
+            # Direction label
+            english_dir = result['direction'].capitalize()
+            if result['axis'] == "horizontal":
+                english_dir = "Left" if result['direction'] == "left" else "Right"
+            else:
+                english_dir = "Down" if result['direction'] in ("up", "left") else "Up"
+            
+            ax4.set_title(
+                f'4. Pattern-Based Nystagmus Analysis ({axis_name} - Direction: {english_dir}, '
+                f'SPV: {result["spv"]:.1f}°/s, CV: {result["cv"]:.1f}%)', 
+                fontsize=10, fontweight='bold'
+            )
+            ax4.set_xlabel('Time (s)')
+            ax4.set_ylabel('Position (°)')
+            ax4.legend(loc='upper right', fontsize=8)
+            ax4.grid(True, alpha=0.3)
+            
+            fig_nys.tight_layout()
+            
+            canvas_nys = FigureCanvasTkAgg(fig_nys, master=plot_frame)
+            canvas_nys.draw()
+            canvas_nys.get_tk_widget().pack(fill="both", expand=True)
+        
+        # Statistics summary at bottom
+        stats_frame = ctk.CTkFrame(frame)
+        stats_frame.pack(pady=5, padx=5, fill="x")
+        
+        stats_text = (
+            f"📊 Statistics: Valid samples: {result['n_valid_samples']} | "
+            f"Blink excluded: {result['n_blink_samples']} | "
+            f"Turning points: {len(result['turning_points'])} | "
+            f"Valid patterns: {result['n_patterns']} | "
+            f"Filtered (outliers): {result['n_filtered_patterns']}"
+        )
+        
+        ctk.CTkLabel(
+            stats_frame, 
+            text=stats_text, 
+            font=("Arial", 11),
+            text_color="gray"
+        ).pack(pady=5, padx=10)
+    
+    def _create_nystagmus_summary_tab(self, parent, result_h, result_v):
+        """Create summary tab comparing H and V nystagmus."""
+        frame = ctk.CTkFrame(parent)
+        frame.pack(pady=20, padx=20, fill="both", expand=True)
+        
+        # Title
+        ctk.CTkLabel(
+            frame, 
+            text="📊 Analysis Summary", 
+            font=("Arial", 18, "bold")
+        ).pack(pady=10)
+        
+        # Comparison table
+        table_frame = ctk.CTkFrame(frame)
+        table_frame.pack(pady=20, padx=20, fill="x")
+        
+        # Header
+        headers = ["Metric", "Horizontal (Yaw)", "Vertical (Pitch)"]
+        for i, h in enumerate(headers):
+            ctk.CTkLabel(
+                table_frame, 
+                text=h, 
+                font=("Arial", 12, "bold"),
+                width=180
+            ).grid(row=0, column=i, padx=5, pady=5)
+        
+        # Data rows
+        def get_value(result, key, fmt="{:.2f}"):
+            if not result['success']:
+                return "N/A"
+            val = result.get(key, "N/A")
+            if isinstance(val, (int, float)):
+                return fmt.format(val)
+            return str(val)
+        
+        rows = [
+            ("SPV (°/s)", get_value(result_h, 'spv'), get_value(result_v, 'spv')),
+            ("Direction", result_h.get('direction', 'N/A') if result_h['success'] else 'N/A',
+                         result_v.get('direction', 'N/A') if result_v['success'] else 'N/A'),
+            ("CV (%)", get_value(result_h, 'cv', "{:.1f}"), get_value(result_v, 'cv', "{:.1f}")),
+            ("Patterns", get_value(result_h, 'n_patterns', "{}"), get_value(result_v, 'n_patterns', "{}")),
+            ("Filtered", get_value(result_h, 'n_filtered_patterns', "{}"), get_value(result_v, 'n_filtered_patterns', "{}")),
+        ]
+        
+        for row_idx, (metric, val_h, val_v) in enumerate(rows, start=1):
+            ctk.CTkLabel(table_frame, text=metric, font=("Arial", 12)).grid(row=row_idx, column=0, padx=5, pady=3)
+            ctk.CTkLabel(table_frame, text=val_h, font=("Courier", 12)).grid(row=row_idx, column=1, padx=5, pady=3)
+            ctk.CTkLabel(table_frame, text=val_v, font=("Courier", 12)).grid(row=row_idx, column=2, padx=5, pady=3)
+        
+        # Interpretation
+        interp_frame = ctk.CTkFrame(frame)
+        interp_frame.pack(pady=20, padx=20, fill="x")
+        
+        ctk.CTkLabel(
+            interp_frame, 
+            text="📝 Interpretation", 
+            font=("Arial", 14, "bold")
+        ).pack(pady=5)
+        
+        # Generate interpretation
+        interpretation = []
+        
+        if result_h['success'] and result_h['n_patterns'] > 0:
+            if result_h['spv'] >= 3.0:
+                interpretation.append(f"• Significant horizontal nystagmus detected ({result_h['direction']})")
+                interpretation.append(f"  SPV = {result_h['spv']:.2f}°/s, {result_h['n_patterns']} valid patterns")
+            else:
+                interpretation.append(f"• Mild horizontal nystagmus ({result_h['direction']}, SPV = {result_h['spv']:.2f}°/s)")
+        else:
+            interpretation.append("• No significant horizontal nystagmus detected")
+        
+        if result_v['success'] and result_v['n_patterns'] > 0:
+            if result_v['spv'] >= 3.0:
+                interpretation.append(f"• Significant vertical nystagmus detected ({result_v['direction']})")
+                interpretation.append(f"  SPV = {result_v['spv']:.2f}°/s, {result_v['n_patterns']} valid patterns")
+            else:
+                interpretation.append(f"• Mild vertical nystagmus ({result_v['direction']}, SPV = {result_v['spv']:.2f}°/s)")
+        else:
+            interpretation.append("• No significant vertical nystagmus detected")
+        
+        # CV quality assessment
+        for axis, result in [("Horizontal", result_h), ("Vertical", result_v)]:
+            if result['success'] and result['cv'] < float('inf'):
+                if result['cv'] <= 20:
+                    interpretation.append(f"• {axis} CV = {result['cv']:.1f}% (Good consistency)")
+                elif result['cv'] <= 40:
+                    interpretation.append(f"• {axis} CV = {result['cv']:.1f}% (Moderate variability)")
+                else:
+                    interpretation.append(f"• {axis} CV = {result['cv']:.1f}% (High variability - check data quality)")
+        
+        interp_text = "\n".join(interpretation)
+        ctk.CTkLabel(
+            interp_frame, 
+            text=interp_text, 
+            font=("Arial", 12),
+            justify="left"
+        ).pack(pady=10, padx=10, anchor="w")
+        
+        # Note about blink exclusion
+        ctk.CTkLabel(
+            frame, 
+            text="ℹ️ Note: Blink segments were automatically excluded from analysis\nto ensure accurate nystagmus detection.",
+            font=("Arial", 11),
+            text_color="gray",
+            justify="center"
+        ).pack(pady=10)
 
     def create_gaze_vector_window(self, smoothed_data):
         """Create a window to visualize 3D gaze vector as arrow."""
@@ -1346,14 +2159,28 @@ class GazeVisualizerApp(ctk.CTk):
         self.label_status.configure(text="Processing finished.")
         
         # Clean up windows
-        if hasattr(self, 'win_eye') and self.win_eye.winfo_exists():
-            self.win_eye.destroy()
-        if hasattr(self, 'win_gaze') and self.win_gaze.winfo_exists():
-            self.win_gaze.destroy()
+        windows_to_close = ['win_eye', 'win_gaze', 'win_video', 'win_gaze_vector', 'win_progress']
+        for win_name in windows_to_close:
+            if hasattr(self, win_name):
+                win = getattr(self, win_name)
+                if win is not None:
+                    try:
+                        if win.winfo_exists():
+                            win.destroy()
+                    except:
+                        pass
             
-        # Close figure
+        # Close figures
         if hasattr(self, 'fig'):
-            plt.close(self.fig)
+            try:
+                plt.close(self.fig)
+            except:
+                pass
+        if hasattr(self, 'fig_3d'):
+            try:
+                plt.close(self.fig_3d)
+            except:
+                pass
 
 if __name__ == "__main__":
     app = GazeVisualizerApp()
