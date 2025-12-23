@@ -386,25 +386,66 @@ class MediaPipeEyeNormalizer:
     """Using MediaPipe to extract and normalize eye ROI."""
     
     # MediaPipe FaceMesh indices
-    # Left Eye
+    # Left Eye - Main landmarks
     LEFT_EYE_OUTER = 263
     LEFT_EYE_INNER = 362
     LEFT_EYE_UPPER = 386
     LEFT_EYE_BOTTOM = 374
+    LEFT_PUPIL = 468  # iris center (from refine_landmarks)
     
-    # Right Eye
+    # Left Eye - Additional landmarks for better alignment
+    LEFT_EYE_UPPER_LEFT = 387
+    LEFT_EYE_UPPER_RIGHT = 385
+    LEFT_EYE_LOWER_LEFT = 380
+    LEFT_EYE_LOWER_RIGHT = 373
+    
+    # Right Eye - Main landmarks
     RIGHT_EYE_OUTER = 33
     RIGHT_EYE_INNER = 133
     RIGHT_EYE_UPPER = 159
     RIGHT_EYE_BOTTOM = 145
+    RIGHT_PUPIL = 473  # iris center (from refine_landmarks)
+    
+    # Right Eye - Additional landmarks for better alignment
+    RIGHT_EYE_UPPER_LEFT = 160
+    RIGHT_EYE_UPPER_RIGHT = 158
+    RIGHT_EYE_LOWER_LEFT = 144
+    RIGHT_EYE_LOWER_RIGHT = 153
     
     def __init__(self, eye: str = 'left', target_size: Tuple[int, int] = (36, 60),
                  padding: float = 0.15, preprocessing_kwargs: Optional[dict] = None,
-                 blink_window_extend_sec: float = 0.3):
+                 blink_window_extend_sec: float = 0.3,
+                 extraction_method: str = 'perspective',  # 'perspective', 'affine', 'affine_6pt', 'bbox_scale', or 'bbox_fill'
+                 # Simplified brightness/contrast enhancement (grayscale only)
+                 enhance_enabled: bool = True,  # Enable grayscale enhancement
+                 enhance_gamma: float = 1.0,    # Gamma for brightness (lower=brighter, 1.0=no change)
+                 enhance_clahe_clip: float = 1.2):  # CLAHE clip limit for contrast (higher=more contrast)
+        """
+        Eye extraction methods:
+        - 'perspective': 4-point perspective transform (RECOMMENDED - closest to MPIIGaze normalization)
+        - 'affine': 3-point affine transform (simple, but doesn't handle perspective)
+        - 'affine_6pt': 6-point homography (more robust affine)
+        - 'bbox_scale': Bounding box with aspect ratio preservation
+        - 'bbox_fill': Bounding box stretched to fill (may distort)
+        
+        Simplified enhancement (grayscale output):
+        - enhance_enabled: Enable/disable enhancement
+        - enhance_gamma: Brightness control (0.3=very bright, 1.0=no change)
+        - enhance_clahe_clip: Contrast control (1.0=minimal, 4.0=strong)
+        """
         self.eye = eye.lower()
         self.target_size = target_size  # (H, W)
         self.padding = np.clip(padding, 0.05, 0.4)
         self.blink_window_extend_sec = blink_window_extend_sec  # Time-based blink window extension
+        self.extraction_method = extraction_method  # Method for eye extraction
+        
+        # Simplified enhancement settings
+        self.enhance_enabled = enhance_enabled
+        self.enhance_gamma = enhance_gamma
+        self.enhance_clahe_clip = enhance_clahe_clip
+        
+        # CLAHE with user-specified clip limit
+        self.clahe = cv2.createCLAHE(clipLimit=enhance_clahe_clip, tileGridSize=(4, 4))
         
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -437,12 +478,35 @@ class MediaPipeEyeNormalizer:
         inner_x = w * (1.0 - self.padding)
         center_y = h * 0.55
         upper_y = h * 0.25
+        lower_y = h * 0.75
         
-        # Target points for affine transform
+        # Target points for 3-point affine transform (used if method='affine')
         self.target_points = np.float32([
             [outer_x, center_y],   # outer corner
             [inner_x, center_y],   # inner corner
             [w * 0.5, upper_y],    # upper eyelid
+        ])
+        
+        # Target points for 4-point PERSPECTIVE transform (method='perspective')
+        # Using 4 corners of eye: outer, inner, upper, lower
+        # This is closest to MPIIGaze's perspective normalization
+        self.target_points_4pt = np.float32([
+            [outer_x, center_y],           # outer corner
+            [inner_x, center_y],           # inner corner
+            [w * 0.5, upper_y],            # upper center
+            [w * 0.5, lower_y],            # lower center
+        ])
+        
+        # Target points for 6-point affine transform (method='affine_6pt')
+        # More points = more robust alignment, similar to MPIIGaze normalization
+        # Format: [outer, inner, upper, lower, upper_left, upper_right]
+        self.target_points_6pt = np.float32([
+            [outer_x, center_y],           # outer corner
+            [inner_x, center_y],           # inner corner  
+            [w * 0.5, upper_y],            # upper center
+            [w * 0.5, lower_y],            # lower center
+            [w * 0.35, upper_y + 2],       # upper left
+            [w * 0.65, upper_y + 2],       # upper right
         ])
         
         self.last_roi_tensor = None
@@ -477,6 +541,36 @@ class MediaPipeEyeNormalizer:
         
         # Threshold: typically 0.15 - 0.25 indicates blinking
         return ratio < 0.20
+    
+    def _enhance_simple(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """
+        Simple grayscale enhancement with Gamma + CLAHE.
+        
+        Uses self.enhance_gamma and self.enhance_clahe_clip parameters.
+        - gamma=1.0: no brightness change
+        - clahe_clip=1.2: light contrast enhancement
+        """
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Step 1: Gamma correction (only if gamma != 1.0)
+        if self.enhance_gamma != 1.0:
+            inv_gamma = 1.0 / self.enhance_gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 
+                             for i in range(256)]).astype("uint8")
+            gray = cv2.LUT(gray, table)
+        
+        # Step 2: CLAHE for contrast
+        gray = self.clahe.apply(gray)
+        
+        # Step 3: Contrast stretching to use full range
+        p2, p98 = np.percentile(gray, (1, 99))
+        if p98 > p2:
+            gray = np.clip(gray, p2, p98)
+            gray = ((gray - p2) / (p98 - p2) * 255).astype(np.uint8)
+        
+        # Convert back to BGR for consistent processing
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     def extract(self, frame_bgr: np.ndarray, timestamp: float = None) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray], bool]:
         """
@@ -491,8 +585,14 @@ class MediaPipeEyeNormalizer:
         """
         if frame_bgr is None or frame_bgr.size == 0:
             return None, None, False
+        
+        # Simple grayscale enhancement (Gamma + CLAHE)
+        if self.enhance_enabled:
+            frame_for_detection = self._enhance_simple(frame_bgr)
+        else:
+            frame_for_detection = frame_bgr
             
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        frame_rgb = cv2.cvtColor(frame_for_detection, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(frame_rgb)
         
         if not results.multi_face_landmarks:
@@ -522,7 +622,7 @@ class MediaPipeEyeNormalizer:
             self._blink_history.append(is_blinking)
             effective_blink = any(self._blink_history)
         
-        h_img, w_img, _ = frame_bgr.shape
+        h_img, w_img, _ = frame_for_detection.shape
         
         # Select points based on eye
         if self.eye == 'right':
@@ -543,22 +643,208 @@ class MediaPipeEyeNormalizer:
         inner_corner = np.array(get_point(inner_idx), dtype=np.float32)
         upper_center = np.array(get_point(upper_idx), dtype=np.float32)
         
-        source_points = np.float32([
-            outer_corner,
-            inner_corner,
-            upper_center
-        ])
+        # Also get bottom point for better bounding box
+        if self.eye == 'right':
+            bottom_idx = self.RIGHT_EYE_BOTTOM
+        else:
+            bottom_idx = self.LEFT_EYE_BOTTOM
+        bottom_center = np.array(get_point(bottom_idx), dtype=np.float32)
         
         try:
-            M = cv2.getAffineTransform(source_points, self.target_points)
             h, w = self.target_size
-            warped = cv2.warpAffine(
-                frame_bgr,
-                M,
-                (w, h),
-                flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REFLECT101
-            )
+            
+            if self.extraction_method == 'bbox_fill':
+                # Method: Bounding box with FILL - stretches to fill target (allows some distortion)
+                # Best for maximizing eye pixels, slight aspect ratio change is acceptable
+                
+                # Get eye bounding box from landmarks
+                all_eye_points = np.array([outer_corner, inner_corner, upper_center, bottom_center])
+                x_min, y_min = all_eye_points.min(axis=0)
+                x_max, y_max = all_eye_points.max(axis=0)
+                
+                # Minimal padding - we want the eye to fill the frame
+                bbox_w = x_max - x_min
+                bbox_h = y_max - y_min
+                pad_x = bbox_w * 0.12
+                pad_y = bbox_h * 0.35
+                
+                x_min = max(0, x_min - pad_x)
+                x_max = min(w_img, x_max + pad_x)
+                y_min = max(0, y_min - pad_y)
+                y_max = min(h_img, y_max + pad_y)
+                
+                # Crop the eye region
+                x_min_i, y_min_i = int(x_min), int(y_min)
+                x_max_i, y_max_i = int(x_max), int(y_max)
+                
+                cropped = frame_for_detection[y_min_i:y_max_i, x_min_i:x_max_i]
+                
+                if cropped.size == 0:
+                    return None, None, False
+                
+                # Resize directly to target size (allows distortion but maximizes eye pixels)
+                warped = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_AREA)
+                
+            elif self.extraction_method == 'bbox_scale':
+                # Method: Bounding box with aspect ratio preservation
+                # This avoids the distortion caused by affine transform
+                
+                # Get eye bounding box from landmarks
+                all_eye_points = np.array([outer_corner, inner_corner, upper_center, bottom_center])
+                x_min, y_min = all_eye_points.min(axis=0)
+                x_max, y_max = all_eye_points.max(axis=0)
+                
+                # Add minimal padding around the eye (smaller padding = larger eye in final image)
+                bbox_w = x_max - x_min
+                bbox_h = y_max - y_min
+                pad_x = bbox_w * 0.15  # Reduced horizontal padding for larger eye
+                pad_y = bbox_h * 0.4   # Reduced vertical padding
+                
+                x_min = max(0, x_min - pad_x)
+                x_max = min(w_img, x_max + pad_x)
+                y_min = max(0, y_min - pad_y)
+                y_max = min(h_img, y_max + pad_y)
+                
+                # Crop the eye region
+                x_min_i, y_min_i = int(x_min), int(y_min)
+                x_max_i, y_max_i = int(x_max), int(y_max)
+                
+                cropped = frame_for_detection[y_min_i:y_max_i, x_min_i:x_max_i]
+                
+                if cropped.size == 0:
+                    return None, None, False
+                
+                crop_h, crop_w = cropped.shape[:2]
+                
+                # Calculate scale to fit within target size while preserving aspect ratio
+                scale = min(w / crop_w, h / crop_h)
+                new_w = int(crop_w * scale)
+                new_h = int(crop_h * scale)
+                
+                # Resize with preserved aspect ratio
+                resized = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                
+                # Create padded image (use edge reflection instead of black)
+                padded = np.zeros((h, w, 3), dtype=np.uint8)
+                
+                # Calculate padding offsets to center the eye
+                y_offset = (h - new_h) // 2
+                x_offset = (w - new_w) // 2
+                
+                # Fill with edge colors for smooth borders
+                if new_h > 0 and new_w > 0:
+                    # Top/bottom edge extension
+                    if y_offset > 0:
+                        padded[:y_offset, x_offset:x_offset+new_w] = resized[0:1, :]
+                        padded[y_offset+new_h:, x_offset:x_offset+new_w] = resized[-1:, :]
+                    # Left/right edge extension
+                    if x_offset > 0:
+                        padded[y_offset:y_offset+new_h, :x_offset] = resized[:, 0:1]
+                        padded[y_offset:y_offset+new_h, x_offset+new_w:] = resized[:, -1:]
+                    # Corners
+                    if y_offset > 0 and x_offset > 0:
+                        padded[:y_offset, :x_offset] = resized[0, 0]
+                        padded[:y_offset, x_offset+new_w:] = resized[0, -1]
+                        padded[y_offset+new_h:, :x_offset] = resized[-1, 0]
+                        padded[y_offset+new_h:, x_offset+new_w:] = resized[-1, -1]
+                    
+                    # Place the resized image
+                    padded[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+                
+                warped = padded
+            
+            elif self.extraction_method == 'perspective':
+                # Method: 4-point PERSPECTIVE transform (RECOMMENDED)
+                # This is the closest match to MPIIGaze's normalization approach
+                # Uses exactly 4 eye corners to compute a perspective transform matrix
+                # which can handle 3D perspective distortion (unlike affine transform)
+                
+                # 4 source points: outer corner, inner corner, upper center, lower center
+                source_points_4 = np.float32([
+                    outer_corner,
+                    inner_corner,
+                    upper_center,
+                    bottom_center
+                ])
+                
+                # Get perspective transform matrix (3x3)
+                # This is what MPIIGaze essentially does - cancel perspective distortion
+                M = cv2.getPerspectiveTransform(source_points_4, self.target_points_4pt)
+                
+                warped = cv2.warpPerspective(
+                    frame_for_detection,
+                    M,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT101
+                )
+                
+            elif self.extraction_method == 'affine_6pt':
+                # Method: 6-point affine transform using homography
+                # More similar to MPIIGaze normalization - uses multiple landmarks
+                # for more robust geometric alignment
+                
+                # Get additional landmarks for 6-point alignment
+                if self.eye == 'right':
+                    upper_left_idx = self.RIGHT_EYE_UPPER_LEFT
+                    upper_right_idx = self.RIGHT_EYE_UPPER_RIGHT
+                else:
+                    upper_left_idx = self.LEFT_EYE_UPPER_LEFT
+                    upper_right_idx = self.LEFT_EYE_UPPER_RIGHT
+                
+                upper_left = np.array(get_point(upper_left_idx), dtype=np.float32)
+                upper_right = np.array(get_point(upper_right_idx), dtype=np.float32)
+                
+                # 6 source points: outer, inner, upper, lower, upper_left, upper_right
+                source_points_6 = np.float32([
+                    outer_corner,
+                    inner_corner,
+                    upper_center,
+                    bottom_center,
+                    upper_left,
+                    upper_right
+                ])
+                
+                # Use homography (perspective transform) for better alignment
+                # This is closer to what MPIIGaze normalization does
+                M, mask = cv2.findHomography(source_points_6, self.target_points_6pt, cv2.RANSAC, 5.0)
+                
+                if M is not None:
+                    warped = cv2.warpPerspective(
+                        frame_for_detection,
+                        M,
+                        (w, h),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REFLECT101
+                    )
+                else:
+                    # Fallback to 3-point affine if homography fails
+                    source_points = np.float32([outer_corner, inner_corner, upper_center])
+                    M = cv2.getAffineTransform(source_points, self.target_points)
+                    warped = cv2.warpAffine(
+                        frame_for_detection,
+                        M,
+                        (w, h),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REFLECT101
+                    )
+                
+            else:
+                # Original 3-point affine transform method (method='affine')
+                source_points = np.float32([
+                    outer_corner,
+                    inner_corner,
+                    upper_center
+                ])
+                
+                M = cv2.getAffineTransform(source_points, self.target_points)
+                warped = cv2.warpAffine(
+                    frame_for_detection,
+                    M,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT101
+                )
             
             if self.eye == 'right':
                 warped = cv2.flip(warped, 1)
@@ -757,7 +1043,9 @@ class GazeVisualizerApp(ctk.CTk):
 
     def load_default_checkpoint(self):
         possible_paths = [
-            "checkpoints/checkpoint_best.pth",
+            "checkpoints/gaze/checkpoint_best.pth",   # New location
+            "checkpoints/gaze/checkpoint_latest.pth",
+            "checkpoints/checkpoint_best.pth",        # Fallback to old location
             "checkpoints/checkpoint_latest.pth"
         ]
         for path in possible_paths:
@@ -1255,11 +1543,11 @@ class GazeVisualizerApp(ctk.CTk):
         self.label_status.configure(text="Review Mode: Drag on plot to see video frame.")
         
         # Close progress window if exists
-        if hasattr(self, 'win_progress') and self.win_progress.winfo_exists():
+        if hasattr(self, 'win_progress') and self.win_progress is not None and self.win_progress.winfo_exists():
             self.win_progress.destroy()
         
         # Create or update eye window
-        if not hasattr(self, 'win_eye') or not self.win_eye.winfo_exists():
+        if not hasattr(self, 'win_eye') or self.win_eye is None or not self.win_eye.winfo_exists():
             self.win_eye = ctk.CTkToplevel(self)
             self.win_eye.title("Review: Extracted Eye")
             self.win_eye.geometry("300x200")
@@ -1269,7 +1557,7 @@ class GazeVisualizerApp(ctk.CTk):
             self.win_eye.title("Review: Extracted Eye")
             
         # Create Video Review Window
-        if not hasattr(self, 'win_video') or not self.win_video.winfo_exists():
+        if not hasattr(self, 'win_video') or self.win_video is None or not self.win_video.winfo_exists():
             self.win_video = ctk.CTkToplevel(self)
             self.win_video.title("Review: Original Video")
             self.win_video.geometry("640x480")
@@ -1372,7 +1660,7 @@ class GazeVisualizerApp(ctk.CTk):
             # Add Save button to export plist data
             self.btn_save_plist = ctk.CTkButton(
                 self.frame_buttons, 
-                text="💾 Save as Plist", 
+                text="[Save] Export Plist", 
                 command=lambda: self.save_to_plist(smoothed_data),
                 fg_color="green",
                 hover_color="darkgreen",
@@ -1383,7 +1671,7 @@ class GazeVisualizerApp(ctk.CTk):
             # Add Nystagmus Analysis button
             self.btn_nystagmus = ctk.CTkButton(
                 self.frame_buttons, 
-                text="🔬 Nystagmus Analysis", 
+                text="[Analyze] Nystagmus", 
                 command=lambda: self.analyze_nystagmus(smoothed_data),
                 fg_color="#8B4513",
                 hover_color="#654321",
@@ -1433,7 +1721,7 @@ class GazeVisualizerApp(ctk.CTk):
         """Display nystagmus analysis results in a new window."""
         # Create results window (larger to fit 4 subplots)
         self.win_nystagmus = ctk.CTkToplevel(self)
-        self.win_nystagmus.title("🔬 Nystagmus Analysis Results")
+        self.win_nystagmus.title("Nystagmus Analysis Results")
         self.win_nystagmus.geometry("1100x900")
         
         # Title
@@ -1505,7 +1793,7 @@ class GazeVisualizerApp(ctk.CTk):
         dir_frame = ctk.CTkFrame(metrics_frame)
         dir_frame.pack(side="left", padx=15, pady=5)
         ctk.CTkLabel(dir_frame, text="Direction", font=("Arial", 11)).pack()
-        dir_symbols = {"left": "← Left", "right": "Right →", "up": "↑ Up", "down": "Down ↓", "unknown": "?"}
+        dir_symbols = {"left": "<< Left", "right": "Right >>", "up": "Up ^", "down": "Down v", "unknown": "?"}
         dir_colors = {"left": "yellow", "right": "yellow", "up": "orange", "down": "orange", "unknown": "gray"}
         ctk.CTkLabel(
             dir_frame, 
@@ -1686,7 +1974,7 @@ class GazeVisualizerApp(ctk.CTk):
         stats_frame.pack(pady=5, padx=5, fill="x")
         
         stats_text = (
-            f"📊 Statistics: Valid samples: {result['n_valid_samples']} | "
+            f"Statistics: Valid samples: {result['n_valid_samples']} | "
             f"Blink excluded: {result['n_blink_samples']} | "
             f"Turning points: {len(result['turning_points'])} | "
             f"Valid patterns: {result['n_patterns']} | "
@@ -1708,7 +1996,7 @@ class GazeVisualizerApp(ctk.CTk):
         # Title
         ctk.CTkLabel(
             frame, 
-            text="📊 Analysis Summary", 
+            text="Analysis Summary", 
             font=("Arial", 18, "bold")
         ).pack(pady=10)
         
@@ -1858,10 +2146,10 @@ class GazeVisualizerApp(ctk.CTk):
         self.ax_3d.set_xlim([-0.5, 0.5])
         self.ax_3d.set_ylim([0, 1.2])
         self.ax_3d.set_zlim([-0.3, 0.5])
-        self.ax_3d.set_xlabel('X (Left ← → Right)', fontsize=10)
-        self.ax_3d.set_ylabel('Y (Depth: Person → Camera)', fontsize=10, fontweight='bold')
-        self.ax_3d.set_zlabel('Z (Down ↓ ↑ Up)', fontsize=10)
-        self.ax_3d.set_title('Gaze Direction: Eye → Camera', fontsize=12, fontweight='bold')
+        self.ax_3d.set_xlabel('X (Left <-> Right)', fontsize=10)
+        self.ax_3d.set_ylabel('Y (Depth: Person -> Camera)', fontsize=10, fontweight='bold')
+        self.ax_3d.set_zlabel('Z (Down <-> Up)', fontsize=10)
+        self.ax_3d.set_title('Gaze Direction: Eye -> Camera', fontsize=12, fontweight='bold')
         
         # Person position (eye center at origin)
         person_x, person_y, person_z = 0, 0, 0
@@ -1942,7 +2230,7 @@ class GazeVisualizerApp(ctk.CTk):
         
         # Determine gaze direction description
         if abs(pitch) < 5 and abs(yaw) < 5:
-            direction = '👁️ Looking straight'
+            direction = 'Looking straight'
         elif abs(yaw) > abs(pitch):
             direction = f'Looking {"right" if yaw > 0 else "left"}'
         else:
@@ -1967,11 +2255,11 @@ class GazeVisualizerApp(ctk.CTk):
         # Update info label
         if hasattr(self, 'lbl_vector_info'):
             if abs(pitch) < 5 and abs(yaw) < 5:
-                direction = '👁️ Looking straight'
+                direction = 'Looking straight'
             elif abs(yaw) > abs(pitch):
-                direction = f'Looking {"right →" if yaw > 0 else "← left"}'
+                direction = f'Looking {"right >>" if yaw > 0 else "<< left"}'
             else:
-                direction = f'Looking {"up ↑" if pitch > 0 else "down ↓"}'
+                direction = f'Looking {"up ^" if pitch > 0 else "down v"}'
             self.lbl_vector_info.configure(
                 text=f"Pitch: {pitch:.1f}° | Yaw: {yaw:.1f}° | {direction}"
             )
@@ -2120,12 +2408,12 @@ class GazeVisualizerApp(ctk.CTk):
                 eye_img_big = cv2.resize(eye_img, (w*scale, h*scale), interpolation=cv2.INTER_NEAREST)
                 img = Image.fromarray(eye_img_big)
                 ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w*scale, h*scale))
-                if hasattr(self, 'win_eye') and self.win_eye.winfo_exists():
+                if hasattr(self, 'win_eye') and self.win_eye is not None and self.win_eye.winfo_exists():
                     self.lbl_eye_img.configure(image=ctk_img)
                     self.lbl_eye_img.image = ctk_img
         
         # Update 3D Gaze Vector View (if window exists)
-        if hasattr(self, 'ax_3d') and hasattr(self, 'win_gaze_vector') and self.win_gaze_vector.winfo_exists():
+        if hasattr(self, 'ax_3d') and hasattr(self, 'win_gaze_vector') and self.win_gaze_vector is not None and self.win_gaze_vector.winfo_exists():
             self.update_gaze_vector_display(idx)
         
         # Update Video View (Slower, maybe skip if dragging too fast?)
@@ -2134,7 +2422,7 @@ class GazeVisualizerApp(ctk.CTk):
             frame_idx = self.frame_index_history[idx]
             self.review_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = self.review_cap.read()
-            if ret and hasattr(self, 'win_video') and self.win_video.winfo_exists():
+            if ret and hasattr(self, 'win_video') and self.win_video is not None and self.win_video.winfo_exists():
                 # Resize to fit window
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w = frame_rgb.shape[:2]

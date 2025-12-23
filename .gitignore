@@ -71,3 +71,6 @@ test_*.py
 test_*.html
 *_test.py
 *_temp.py
+
+# Project Reference
+ref/
